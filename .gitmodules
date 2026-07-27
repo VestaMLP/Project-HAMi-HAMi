@@ -1,4 +1,4 @@
 [submodule "libvgpu"]
 	path = libvgpu
-	url = https://github.com/Project-HAMi/HAMi-core.git
+	url = https://github.com/VestaMLP/Project-HAMi-HAMi-core.git
 	branch = main
