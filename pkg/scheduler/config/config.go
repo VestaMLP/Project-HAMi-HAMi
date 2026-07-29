@@ -298,11 +298,11 @@ func InitDevices() {
 func InitDefaultDevices() {
 	configMapdata := `
 nvidia:
-  resourceCountName: "nvidia.com/gpu"
-  resourceMemoryName: "nvidia.com/gpumem"
-  resourceMemoryPercentageName: "nvidia.com/gpumem-percentage"
-  resourceCoreName: "nvidia.com/gpucores"
-  resourcePriorityName: "nvidia.com/priority"
+  resourceCountName: "yxqiche.com/gpu"
+  resourceMemoryName: "yxqiche.com/gpumem"
+  resourceMemoryPercentageName: "yxqiche.com/gpumem-percentage"
+  resourceCoreName: "yxqiche.com/gpucores"
+  resourcePriorityName: "yxqiche.com/priority"
   overwriteEnv: false
   defaultMemory: 0
   defaultCores: 0

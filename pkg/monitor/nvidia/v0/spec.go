@@ -137,6 +137,10 @@ func (s Spec) SetDeviceSmLimit(l uint64) {
 	}
 }
 
+func (s Spec) DeviceSmLimit(idx int) uint64 {
+	return s.sr.smLimit[idx]
+}
+
 func (s Spec) IsValidUUID(idx int) bool {
 	return s.sr.uuids[idx].uuid[0] != 0
 }

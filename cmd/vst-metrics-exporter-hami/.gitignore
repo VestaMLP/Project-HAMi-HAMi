@@ -1,0 +1,14 @@
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+.sw[a-p]
+.*.sw[a-p]
+Session.vim
+.vscode/*
+.history
+.idea
+vendor

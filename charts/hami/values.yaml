@@ -22,11 +22,11 @@ fullnameOverride: ""
 namespaceOverride: ""
 
 #Nvidia GPU Parameters
-resourceName: "nvidia.com/gpu"
-resourceMem: "nvidia.com/gpumem"
-resourceMemPercentage: "nvidia.com/gpumem-percentage"
-resourceCores: "nvidia.com/gpucores"
-resourcePriority: "nvidia.com/priority"
+resourceName: "yxqiche.com/gpu"
+resourceMem: "yxqiche.com/gpumem"
+resourceMemPercentage: "yxqiche.com/gpumem-percentage"
+resourceCores: "yxqiche.com/gpucores"
+resourcePriority: "yxqiche.com/priority"
 
 #MLU Parameters
 mluResourceName: "cambricon.com/vmlu"

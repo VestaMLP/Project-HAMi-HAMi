@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vst-metrics-hami-exporter
+  namespace: monitor
+  labels:
+    app: vst-metrics-hami-exporter
+spec:
+  selector:
+    matchLabels:
+      app: vst-metrics-hami-exporter
+  template:
+    metadata:
+      labels:
+        app: vst-metrics-hami-exporter
+    spec:
+      nodeSelector:
+        nvidia.com/gpu: 'true'
+      containers:
+        - name: vst-metrics-hami-exporter
+          image: hub.innerstar.com/vesta/vst-metrics-hami-exporter:v0.2.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: MY_NODE_NAME # 主机名称（必须）
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_NAME # HAMi所需的环境变量名（与vGPUmonitor一致）
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HOOK_PATH # libvgpu.so共享内存路径（必须）
+              value: "/usr/local/vgpu"
+            - name: KUBECONFIG # K8s配置文件路径
+              value: "/etc/kubernetes/kubeconfig"
+          ports:
+            - containerPort: 9808
+              name: http
+          volumeMounts:
+            - name: hook-path-volume
+              mountPath: /usr/local/vgpu
+              readOnly: true
+            - name: kubeconfig-volume
+              mountPath: /etc/kubernetes/kubeconfig
+              subPath: kubeconfig
+          resources:
+            limits:
+              cpu: 800m
+              memory: 800Mi
+            requests:
+              cpu: 600m
+              memory: 600Mi
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: hook-path-volume
+          hostPath:
+            path: /usr/local/vgpu # libvgpu.so的共享内存目录
+            type: Directory
+        - name: kubeconfig-volume
+          configMap:
+            name: vst-metrics-exporter-kubeconfig
+
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vst-metrics-hami-exporter
+  namespace: monitor
+  labels:
+    app: vst-metrics-hami-exporter
+spec:
+  clusterIP: None
+  type: ClusterIP
+  selector:
+    app: vst-metrics-hami-exporter
+  ports:
+    - name: http
+      port: 9808
+      protocol: TCP
+      targetPort: 9808
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    release: prometheus
+  name: vst-metrics-hami-exporter
+  namespace: monitor
+spec:
+  endpoints:
+    - honorLabels: true # 保留被监控服务的原始指标标签，避免 Prometheus 自动添加或覆盖标签。
+      interval: 10s
+      path: /metrics
+      port: http
+      relabelings:
+        - action: replace
+          regex: (.*)
+          replacement: $1
+          sourceLabels:
+            - __meta_kubernetes_service_label_cluster_id
+          targetLabel: cluster_id
+        - action: replace
+          regex: (.*)
+          replacement: $1
+          sourceLabels:
+            - __meta_kubernetes_endpoint_node_name
+          targetLabel: node_name
+      scheme: http
+      scrapeTimeout: 9s
+  namespaceSelector:
+    matchNames:
+      - monitor
+  selector:
+    matchLabels:
+      app: vst-metrics-hami-exporter

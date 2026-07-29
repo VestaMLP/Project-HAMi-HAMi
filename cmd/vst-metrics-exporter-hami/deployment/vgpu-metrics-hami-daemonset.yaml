@@ -1,0 +1,164 @@
+---
+# 1. ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vst-metrics-hami-exporter
+  namespace: monitoring
+  labels:
+    app: vst-metrics-hami-exporter
+---
+# 2. ClusterRole - 定义权限
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vst-metrics-hami-exporter
+  labels:
+    app: vst-metrics-hami-exporter
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
+---
+# 3. ClusterRoleBinding - 绑定ServiceAccount到ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vst-metrics-hami-exporter
+  labels:
+    app: vst-metrics-hami-exporter
+subjects:
+- kind: ServiceAccount
+  name: vst-metrics-hami-exporter
+  namespace: monitoring
+roleRef:
+  kind: ClusterRole
+  name: vst-metrics-hami-exporter
+  apiGroup: rbac.authorization.k8s.io
+---
+# 4. DaemonSet
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vst-metrics-hami-exporter
+  namespace: monitoring
+  labels:
+    app: vst-metrics-hami-exporter
+spec:
+  selector:
+    matchLabels:
+      app: vst-metrics-hami-exporter
+  template:
+    metadata:
+      labels:
+        app: vst-metrics-hami-exporter
+    spec:
+      serviceAccountName: vst-metrics-hami-exporter  # 指定使用新的ServiceAccount ⭐关键！
+      nodeSelector:
+        nvidia-device-enable: enable
+      containers:
+        - name: vst-metrics-hami-exporter
+          image: harbor.prod.yxit.cc/vesta/vst-metrics-hami-exporter:v0.1.5
+          imagePullPolicy: Always
+          env:
+            - name: ENV_NAME
+              value: "pro"
+            - name: MY_NODE_NAME # 主机名称（必须）
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_NAME # HAMi所需的环境变量名（与vGPUmonitor一致）
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: HOOK_PATH # libvgpu.so共享内存路径（必须）
+              value: "/usr/local/vgpu"
+          ports:
+            - containerPort: 9808
+              name: http
+          volumeMounts:
+            - name: hook-path-volume
+              mountPath: /usr/local/vgpu
+              # readOnly: true  # 注释掉！Mmap需要读写权限来创建内存映射
+            - name: k8s-config-volume
+              mountPath: /app/cmd/conf/pro/k8sconfig.yaml
+              subPath: k8sconfig.yaml
+          resources:
+            limits:
+              cpu: 200m
+              memory: 200Mi
+            requests:
+              cpu: 100m
+              memory: 100Mi
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+            # readOnlyRootFilesystem: true  # 注释掉！Mmap需要读写权限
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: hook-path-volume
+          hostPath:
+            path: /usr/local/vgpu  # libvgpu.so的共享内存目录
+            type: Directory
+
+        - name: k8s-config-volume
+          configMap:
+            name: vst-metrics-exporter
+
+      restartPolicy: Always
+---
+# 5. Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: vst-metrics-hami-exporter
+  namespace: monitoring
+  labels:
+    app: vst-metrics-hami-exporter
+spec:
+  clusterIP: None
+  type: ClusterIP
+  selector:
+    app: vst-metrics-hami-exporter
+  ports:
+    - name: http
+      port: 9808
+      protocol: TCP
+      targetPort: 9808
+---
+# 6. ServiceMonitor
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    release: prometheus
+  name: vst-metrics-hami-exporter
+  namespace: monitoring
+spec:
+  endpoints:
+    - honorLabels: true # 保留被监控服务的原始指标标签，避免 Prometheus 自动添加或覆盖标签。
+      interval: 30s
+      path: /metrics
+      port: http
+      relabelings:
+        - action: replace
+          regex: (.*)
+          replacement: $1
+          sourceLabels:
+            - __meta_kubernetes_service_label_cluster_id
+          targetLabel: cluster_id
+        - action: replace
+          regex: (.*)
+          replacement: $1
+          sourceLabels:
+            - __meta_kubernetes_endpoint_node_name
+          targetLabel: node_name
+      scheme: http
+      scrapeTimeout: 30s
+  namespaceSelector:
+    matchNames:
+      - monitoring
+  selector:
+    matchLabels:
+      app: vst-metrics-hami-exporter

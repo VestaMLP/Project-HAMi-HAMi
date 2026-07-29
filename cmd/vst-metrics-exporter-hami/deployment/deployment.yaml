@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vst-metrics-hami-exporter
+  namespace: monitor
+  labels:
+    app: vst-metrics-hami-exporter
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vst-metrics-hami-exporter
+  template:
+    metadata:
+      labels:
+        app: vst-metrics-hami-exporter
+    spec:
+      nodeName: hgx01
+      containers:
+        - name: vst-metrics-hami-exporter
+          image: hub.innerstar.com/vesta/vst-metrics-hami-exporter:v0.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--path.sysclassinfiniband=/host-sys/class/infiniband"
+          ports:
+            - containerPort: 9808
+              name: http
+          volumeMounts:
+            - name: sys-class-infiniband
+              mountPath: /host-sys
+              readOnly: true
+            - name: k8s-config-volume
+              mountPath: /app/cmd/conf/pro/k8sconfig.yaml
+              subPath: k8sconfig.yaml
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
+            requests:
+              cpu: 50m
+              memory: 50Mi
+          env:
+            - name: ENV_NAME
+              value: "pro"
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+      volumes:
+        - name: sys-class-infiniband
+          hostPath:
+            path: /sys
+            type: Directory
+        - name: k8s-config-volume
+          configMap:
+            name: vst-metrics-hami-exporter

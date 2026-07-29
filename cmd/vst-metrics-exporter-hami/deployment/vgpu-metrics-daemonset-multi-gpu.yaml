@@ -1,0 +1,147 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vst-metrics-multi-gpu-exporter
+  namespace: monitoring
+  labels:
+    app: vst-metrics-multi-gpu-exporter
+spec:
+  selector:
+    matchLabels:
+      app: vst-metrics-multi-gpu-exporter
+  template:
+    metadata:
+      labels:
+        app: vst-metrics-multi-gpu-exporter
+    spec:
+      nodeSelector:
+        vcuda-multi-gpu-enable: enable
+      containers:
+        - name: vst-metrics-multi-gpu-exporter
+          image: harbor.prod.yxit.cc/vesta/vst-metrics-hami-exporter:v0.1.5
+          imagePullPolicy: Always #实际生产环境应为IfNotPresent
+#          command: #实际生产无此项
+#            - /bin/sh
+#            - -c
+#            - "while true; do sleep 360; done"
+          args:
+            - ""
+          env:
+            - name: ENV_NAME
+              value: "pro"  # 根据需要设置为 beta/pro 等
+            - name: MY_NODE_NAME # 主机名称
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - containerPort: 9808
+              name: http
+          volumeMounts:
+            - name: sys-class-infiniband
+              mountPath: /host-sys
+            - name: k8s-config-volume
+              mountPath: /app/cmd/conf/pro/k8sconfig.yaml
+              subPath: k8sconfig.yaml
+            - name: vgpu-metrics-dir
+              mountPath: /etc/vst-metrics-hami-exporter/vgpu-metrics
+            - name: docker-sock
+              mountPath: /var/run/docker.sock
+            - name: docker-root
+              mountPath: /var/lib/docker
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true
+          resources:
+            limits:
+              cpu: 100m
+              memory: 100Mi
+            requests:
+              cpu: 50m
+              memory: 50Mi
+          securityContext:
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+      volumes:
+        - name: sys-class-infiniband
+          hostPath:
+            path: /sys
+            type: Directory
+
+        - name: k8s-config-volume
+          configMap:
+            name: vst-metrics-hami-exporter
+
+        - name: vgpu-metrics-dir
+          hostPath:
+            path: /etc/vst-metrics-hami-exporter/vgpu-metrics
+            type: DirectoryOrCreate
+
+        - name: docker-sock
+          hostPath:
+            path: /var/run/docker.sock
+
+        - name: docker-root
+          hostPath:
+            path: /var/lib/docker
+
+        - name: proc
+          hostPath:
+            path: /proc
+
+      restartPolicy: Always
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vst-metrics-multi-gpu-exporter
+  namespace: monitoring
+  labels:
+    app: vst-metrics-multi-gpu-exporter
+spec:
+  clusterIP: None
+  type: ClusterIP
+  selector:
+    app: vst-metrics-multi-gpu-exporter
+  ports:
+    - name: http
+      port: 9808
+      protocol: TCP
+      targetPort: 9808
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  labels:
+    release: prometheus
+  name: vst-metrics-multi-gpu-exporter
+  namespace: monitoring
+spec:
+  endpoints:
+    - honorLabels: true # 保留被监控服务的原始指标标签，避免 Prometheus 自动添加或覆盖标签。
+      interval: 30s
+      path: /metrics
+      port: http
+      relabelings:
+        - action: replace
+          regex: (.*)
+          replacement: $1
+          sourceLabels:
+            - __meta_kubernetes_service_label_cluster_id
+          targetLabel: cluster_id
+        - action: replace
+          regex: (.*)
+          replacement: $1
+          sourceLabels:
+            - __meta_kubernetes_endpoint_node_name
+          targetLabel: node_name
+      scheme: http
+      scrapeTimeout: 30s
+  namespaceSelector:
+    matchNames:
+      - monitoring
+  selector:
+    matchLabels:
+      app: vst-metrics-multi-gpu-exporter
