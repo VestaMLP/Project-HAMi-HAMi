@@ -32,14 +32,22 @@ func podVestaResourceAdaptor(pod *corev1.Pod) {
 
 	gpuCount := countGPUFromAnnotations(pod)
 
+	hasVestaResource := false
 	for idx, ctr := range pod.Spec.Containers {
 		c := &pod.Spec.Containers[idx]
 		vstCore, hasVstaCore := ctr.Resources.Limits[corev1.ResourceName(vestaRscCoreName)]
 		if hasVstaCore {
-			delete(c.Resources.Limits, corev1.ResourceName(vestaRscCoreName))
-			delete(c.Resources.Limits, corev1.ResourceName(vestaRscMemoryName))
-			delete(c.Resources.Requests, corev1.ResourceName(vestaRscCoreName))
-			delete(c.Resources.Requests, corev1.ResourceName(vestaRscMemoryName))
+			if !hasVestaResource {
+				hasVestaResource = true
+				if pod.Spec.NodeSelector == nil {
+					pod.Spec.NodeSelector = make(map[string]string)
+				}
+				pod.Spec.NodeSelector["vgpu-enable"] = "hami"
+			}
+			//delete(c.Resources.Limits, corev1.ResourceName(vestaRscCoreName))
+			//delete(c.Resources.Limits, corev1.ResourceName(vestaRscMemoryName))
+			//delete(c.Resources.Requests, corev1.ResourceName(vestaRscCoreName))
+			//delete(c.Resources.Requests, corev1.ResourceName(vestaRscMemoryName))
 
 			c.Resources.Limits[nvidiaCoreName] = vstCore
 			c.Resources.Limits[nvidiaMemPercentageName] = vstCore
