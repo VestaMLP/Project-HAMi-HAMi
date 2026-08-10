@@ -522,8 +522,52 @@ func (dev *NvidiaGPUDevices) PatchAnnotations(pod *corev1.Pod, annoinput *map[st
 		(*annoinput)[device.SupportDevices[NvidiaGPUDevice]] = deviceStr
 		klog.V(5).Infof("pod add notation key [%s], values is [%s]", device.InRequestDevices[NvidiaGPUDevice], deviceStr)
 		klog.V(5).Infof("pod add notation key [%s], values is [%s]", device.SupportDevices[NvidiaGPUDevice], deviceStr)
+
+		for _, containerDevices := range devlist {
+			for _, devInfo := range containerDevices {
+				gpuID := fmt.Sprintf("%02d", devInfo.Idx)
+				coreKey := fmt.Sprintf("gpu-allocate/vcuda-core%s", gpuID)
+				memoryKey := fmt.Sprintf("gpu-allocate/vcuda-memory%s", gpuID)
+				(*annoinput)[coreKey] = fmt.Sprint(devInfo.Usedcores)
+
+				memoryPercentage := calculateMemoryPercentage(devInfo.Usedmem, pod, &dev.config)
+				(*annoinput)[memoryKey] = fmt.Sprint(memoryPercentage)
+
+				klog.V(5).Infof("pod add annotation key [%s:%s], value [%s]", coreKey, memoryKey,
+					fmt.Sprintf("%d:%d", devInfo.Usedcores, memoryPercentage))
+			}
+		}
 	}
 	return *annoinput
+}
+
+func calculateMemoryPercentage(usedmem int32, pod *corev1.Pod, config *NvidiaConfig) int32 {
+	if config == nil || usedmem == 0 {
+		return 0
+	}
+
+	for _, ctr := range pod.Spec.Containers {
+		resourceMemPercentageName := corev1.ResourceName(config.ResourceMemoryPercentageName)
+		resourceMemName := corev1.ResourceName(config.ResourceMemoryName)
+
+		if memPct, ok := resourceValue(&ctr, resourceMemPercentageName); ok {
+			return int32(memPct)
+		}
+
+		if mem, ok := resourceValue(&ctr, resourceMemName); ok && mem > 0 {
+			totalmem := config.DefaultMemory
+			if totalmem == 0 {
+				totalmem = 100
+			}
+			percentage := (int32(mem) * 100) / (totalmem * int32(config.MemoryFactor))
+			if percentage > 100 {
+				percentage = 100
+			}
+			return percentage
+		}
+	}
+
+	return 100
 }
 
 func (dev *NvidiaGPUDevices) GenerateResourceRequests(ctr *corev1.Container) device.ContainerDeviceRequest {
@@ -720,6 +764,10 @@ func (dev *NvidiaGPUDevices) AddResourceUsage(pod *corev1.Pod, n *device.DeviceU
 	n.Usedcores += ctr.Usedcores
 	n.Usedmem += ctr.Usedmem
 	return nil
+}
+
+func (dev *NvidiaGPUDevices) GetConfig() NvidiaConfig {
+	return dev.config
 }
 
 func fitQuota(tmpDevs map[string]device.ContainerDevices, allocated *device.PodDevices, ns string, memreq int64, coresreq int64) bool {

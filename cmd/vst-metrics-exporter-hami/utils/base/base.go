@@ -19,9 +19,9 @@ const (
 	CstGseGpuMemResourceName     = "aliyun.com/gpu-mem"
 	CstGeneralGpuMemResourceName = "nvidia.com/gpu"
 
-	CstGpuVcudaCore           = "yxqiche.com/vcuda-core"
-	CstGpuVucdaMemory         = "yxqiche.com/vcuda-memory"
-	CstGpuVcudaDeployStrategy = "yxqiche.com/gpu-deploy-strategy"
+	CstGpuVcudaCore           = "vesta.nvidia/vcuda-core"
+	CstGpuVucdaMemory         = "vesta.nvidia/vcuda-memory"
+	CstGpuVcudaDeployStrategy = "vesta.nvidia/gpu-deploy-strategy"
 	CstStrategyDisperse       = "disperse"
 
 	// env

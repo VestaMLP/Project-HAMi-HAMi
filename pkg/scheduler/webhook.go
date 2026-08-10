@@ -23,6 +23,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -67,13 +68,31 @@ func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Res
 		klog.V(3).Infof(template+" - Pod already has different scheduler assigned", req.Namespace, req.Name, req.UID)
 		return admission.Allowed("pod already has different scheduler assigned")
 	}
-	klog.V(5).Infof(template, pod.Namespace, pod.Name, pod.UID)
+	klog.V(3).Infof(template+" webhook recv", req.Namespace, req.Name, req.UID)
+
+	klog.V(3).Infof("[DEBUG] Request Info - Namespace: %q, Name: %q, UID: %q, Operation: %q", req.Namespace, req.Name, req.UID, req.Operation)
+	klog.V(3).Infof("[DEBUG] Request Object.Raw:\n%s", string(req.Object.Raw))
+
+	klog.V(3).Infof("[DEBUG] Before podVestaResourceAdaptor - Pod Name: %q, Namespace: %q, UID: %q", pod.Name, pod.Namespace, pod.UID)
+	for ci, ctr := range pod.Spec.Containers {
+		klog.V(3).Infof("[DEBUG] Container[%d] %s - Limits: %+v, Requests: %+v",
+			ci, ctr.Name, ctr.Resources.Limits, ctr.Resources.Requests)
+	}
+
+	podVestaResourceAdaptor(pod)
+
+	klog.V(4).Infof("[DEBUG] After podVestaResourceAdaptor - Pod Name: %q, Namespace: %q", pod.Name, pod.Namespace)
+	for ci, ctr := range pod.Spec.Containers {
+		klog.V(4).Infof("[DEBUG] Container[%d] %s - Limits: %+v, Requests: %+v",
+			ci, ctr.Name, ctr.Resources.Limits, ctr.Resources.Requests)
+	}
+
 	hasResource := false
 	for idx, ctr := range pod.Spec.Containers {
 		c := &pod.Spec.Containers[idx]
 		if ctr.SecurityContext != nil {
 			if ctr.SecurityContext.Privileged != nil && *ctr.SecurityContext.Privileged {
-				klog.Warningf(template+" - Denying admission as container %s is privileged", pod.Namespace, pod.Name, pod.UID, c.Name)
+				klog.Warningf(template+" - Denying admission as container %s is privileged", req.Namespace, req.Name, req.UID, c.Name)
 				continue
 			}
 		}
@@ -88,29 +107,27 @@ func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Res
 	}
 
 	if !hasResource {
-		klog.V(3).Infof(template+" - Allowing admission: no GPU resource found", pod.Namespace, pod.Name, pod.UID)
-		//return admission.Allowed("no resource found")
+		klog.V(3).Infof(template+" - Allowing admission: no GPU resource found", req.Namespace, req.Name, req.UID)
 	} else if len(config.SchedulerName) > 0 {
 		pod.Spec.SchedulerName = config.SchedulerName
 		if pod.Spec.NodeName != "" {
-			klog.Infof(template+" - Pod already has node assigned", pod.Namespace, pod.Name, pod.UID)
+			klog.Infof(template+" - Pod already has node assigned", req.Namespace, req.Name, req.UID)
 			return admission.Denied("pod has node assigned")
 		}
 	}
-	if !fitResourceQuota(pod) {
+	if !fitResourceQuota(pod, req.Namespace, req.Name, req.UID) {
 		return admission.Denied("exceeding resource quota")
 	}
 	marshaledPod, err := json.Marshal(pod)
 	if err != nil {
-		klog.Errorf(template+" - Failed to marshal pod, error: %v", pod.Namespace, pod.Name, pod.UID, err)
+		klog.Errorf(template+" - Failed to marshal pod, error: %v", req.Namespace, req.Name, req.UID, err)
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 }
 
-func fitResourceQuota(pod *corev1.Pod) bool {
+func fitResourceQuota(pod *corev1.Pod, namespace, name string, uid types.UID) bool {
 	for deviceName, dev := range device.GetDevices() {
-		// Only supports NVIDIA
 		if deviceName != nvidia.NvidiaGPUDevice {
 			continue
 		}
@@ -150,7 +167,7 @@ func fitResourceQuota(pod *corev1.Pod) bool {
 			klog.V(5).Infof("Adjusting memory request for quota check: oriMemReq %d, memoryReq %d, factor %d", oriMemReq, memoryReq, memoryFactor)
 		}
 		if !device.GetLocalCache().FitQuota(pod.Namespace, memoryReq, memoryFactor, coresReq, deviceName) {
-			klog.Infof(template+" - Denying admission", pod.Namespace, pod.Name, pod.UID)
+			klog.Infof(template+" - Denying admission", namespace, name, uid)
 			return false
 		}
 	}

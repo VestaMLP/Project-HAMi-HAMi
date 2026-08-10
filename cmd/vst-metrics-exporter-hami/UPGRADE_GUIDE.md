@@ -228,7 +228,7 @@ vst_vCudaGpu_vgpu_cores_limit{node="worker-01",pod="training-job",namespace="ml-
 ```bash
 # 使用旧的镜像和配置
 kubectl -n monitor set image daemonset/vst-metrics-hami-exporter \
-  vst-metrics-hami-exporter=hub.innerstar.com/vesta/vst-metrics-hami-exporter:v0.1.0
+  vst-metrics-hami-exporter=hub.innerstar.com/vesta.nvidia/vst-metrics-hami-exporter:v0.1.0
 
 # 或应用旧的yaml文件
 kubectl apply -f deployment/daemonset-v1.yaml

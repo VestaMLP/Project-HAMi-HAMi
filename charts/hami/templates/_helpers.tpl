@@ -200,6 +200,13 @@ Returns a YAML list that can be used directly or converted to JSON via fromYaml 
 {{- $resources = append $resources (dict "name" .Values.resourceCores "ignoredByScheduler" true) -}}
 {{- $resources = append $resources (dict "name" .Values.resourceMemPercentage "ignoredByScheduler" true) -}}
 {{- $resources = append $resources (dict "name" .Values.resourcePriority "ignoredByScheduler" true) -}}
+{{/* Yxqiche vCUDA resources */}}
+{{- if .Values.yxqicheResourceCore -}}
+{{- $resources = append $resources (dict "name" .Values.yxqicheResourceCore "ignoredByScheduler" true) -}}
+{{- end -}}
+{{- if .Values.yxqicheResourceMemory -}}
+{{- $resources = append $resources (dict "name" .Values.yxqicheResourceMemory "ignoredByScheduler" true) -}}
+{{- end -}}
 {{/* MLU resources */}}
 {{- $resources = append $resources (dict "name" .Values.mluResourceName "ignoredByScheduler" true) -}}
 {{/* DCU resources */}}

@@ -58,7 +58,7 @@ spec:
         nvidia-device-enable: enable
       containers:
         - name: vst-metrics-hami-exporter
-          image: harbor.prod.yxit.cc/vesta/vst-metrics-hami-exporter:v0.1.5
+          image: harbor.prod.yxit.cc/vesta.nvidia/vst-metrics-hami-exporter:v0.1.5
           imagePullPolicy: Always
           env:
             - name: ENV_NAME

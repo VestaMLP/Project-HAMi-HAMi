@@ -1,7 +1,7 @@
 
 VERSION?=v0.1.5
 BIN_NAME=vst-metrics-hami-exporter
-IMAGE?=harbor.bjxsj.k8s.yxit.cc/vesta/$(BIN_NAME):$(VERSION)
+IMAGE?=harbor.bjxsj.k8s.yxit.cc/vesta.nvidia/$(BIN_NAME):$(VERSION)
 
 # Golang 源文件目录和编译输出目录
 SRC_DIR=./cmd/main.go
@@ -12,7 +12,7 @@ build:
 
 # 生产镜像仓库
 build-image:
-	docker build -t harbor.prod.yxit.cc/vesta/$(BIN_NAME):$(VERSION) .
+	docker build -t harbor.prod.yxit.cc/vesta.nvidia/$(BIN_NAME):$(VERSION) .
 
 # 在 Windows 系统中交叉编译为 Linux amd64 二进制
 build-windows:

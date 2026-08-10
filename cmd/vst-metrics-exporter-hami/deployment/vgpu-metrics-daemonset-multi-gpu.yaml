@@ -18,7 +18,7 @@ spec:
         vcuda-multi-gpu-enable: enable
       containers:
         - name: vst-metrics-multi-gpu-exporter
-          image: harbor.prod.yxit.cc/vesta/vst-metrics-hami-exporter:v0.1.5
+          image: harbor.prod.yxit.cc/vesta.nvidia/vst-metrics-hami-exporter:v0.1.5
           imagePullPolicy: Always #实际生产环境应为IfNotPresent
 #          command: #实际生产无此项
 #            - /bin/sh

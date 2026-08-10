@@ -18,6 +18,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -397,6 +398,57 @@ func startPlugins(c *cli.Context, o *options) ([]plugin.Interface, bool, error) 
 	if err != nil {
 		return nil, false, fmt.Errorf("error getting plugins: %v", err)
 	}
+
+	physicalGPUCount := 0
+	totalMemoryMB := uint64(0)
+
+	ret := nvmllib.Init()
+	if errors.Is(ret, nvml.SUCCESS) {
+		count, err := nvmllib.DeviceGetCount()
+		if errors.Is(err, nvml.SUCCESS) {
+			physicalGPUCount = count
+			klog.Infof("NVML detected %d physical GPU(s) on node", physicalGPUCount)
+
+			for i := 0; i < physicalGPUCount; i++ {
+				device, err := nvmllib.DeviceGetHandleByIndex(i)
+				if !errors.Is(err, nvml.SUCCESS) {
+					klog.Warningf("Failed to get handle for GPU %d: %v", i, err)
+					continue
+				}
+
+				memoryInfo, ret := device.GetMemoryInfo()
+				if errors.Is(ret, nvml.SUCCESS) {
+					memoryMB := memoryInfo.Total / (1024 * 1024)
+					totalMemoryMB += memoryMB
+					klog.Infof("GPU[%d]: %d MB memory", i, memoryMB)
+				}
+			}
+		} else {
+			klog.Warningf("Failed to get NVML device count: %v", err)
+		}
+		nvmllib.Shutdown()
+	} else {
+		klog.Warningf("Failed to initialize NVML: %v", ret)
+	}
+
+	coreDeviceCount := physicalGPUCount * plugin.GetDummyDeviceMultiplier() // 物理GPU数量 × 100
+	memoryDeviceCount := int(totalMemoryMB / 256)                           // 总显存(MB) ÷ 256
+	if memoryDeviceCount <= 0 {
+		memoryDeviceCount = coreDeviceCount // fallback到core的数量
+	}
+
+	klog.Infof("Detected %d physical GPU(s) with total %d MB memory on node", physicalGPUCount, totalMemoryMB)
+	klog.Infof("Creating Dummy device plugins:")
+	klog.Infof("  - %s: %d devices (%d physical GPUs × %d)", plugin.DummyCoreResourceName, coreDeviceCount, physicalGPUCount, plugin.GetDummyDeviceMultiplier())
+	klog.Infof("  - %s: %d devices (%d MB / 256 MB per unit)", plugin.DummyMemoryResourceName, memoryDeviceCount, totalMemoryMB)
+
+	dummyPlugins := []plugin.Interface{
+		plugin.NewDummyDevicePlugin(plugin.DummyCoreResourceName, coreDeviceCount),
+		plugin.NewDummyDevicePlugin(plugin.DummyMemoryResourceName, memoryDeviceCount),
+	}
+	plugins = append(plugins, dummyPlugins...)
+
+	klog.Infof("Starting Dummy device plugins for yxqiche.com resources")
 
 	// Loop through all plugins, starting them if they have any devices
 	// to serve. If even one plugin fails to start properly, try

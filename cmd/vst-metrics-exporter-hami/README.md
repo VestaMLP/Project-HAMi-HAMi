@@ -21,14 +21,14 @@ Prometheus 抓取 Service 后端 Pod 的指标（`:9808/metrics`）
 ```
 ### Docker相关命令
 #### 构建镜像
-docker build -t hub.innerstar.com/vesta/vst-metrics-hami-exporter:v0.1.1 .
+docker build -t hub.innerstar.com/vesta.nvidia/vst-metrics-hami-exporter:v0.1.1 .
 
 docker build -t harbor.bjxsj.k8s.yxit.cc/vst-metrics-hami-exporter:v0.2.0 .
 #### 登录镜像仓库（如果是私有仓库）
 docker login your-registry
 
 #### 推送镜像
-docker push hub.innerstar.com/vesta/vst-metrics-hami-exporter:v0.1.1
+docker push hub.innerstar.com/vesta.nvidia/vst-metrics-hami-exporter:v0.1.1
 
 #### Docker执行服务
 docker run -it --rm \
@@ -82,7 +82,7 @@ $env:GOOS="windows";
 ```shell
 make build-linux
 make build-image
-docker push harbor.prod.yxit.cc/vesta/vst-metrics-hami-exporter:$(VERSION)
+docker push harbor.prod.yxit.cc/vesta.nvidia/vst-metrics-hami-exporter:$(VERSION)
 ```
 
 ### 版本历史

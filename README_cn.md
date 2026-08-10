@@ -69,8 +69,8 @@ HAMi 让工作负载只申请所需的加速器资源。例如，以下 Pod 请�
 ```yaml
 resources:
   limits:
-    yxqiche.com/gpu: 1
-    yxqiche.com/gpumem: 3000
+    vesta.nvidia/gpu: 1
+    vesta.nvidia/gpumem: 3000
 ```
 
 工作负载在容器内看到已分配的设备资源，HAMi 负责协调调度、分配和隔离。

@@ -8,6 +8,6 @@ GOLANG_IMAGE=golang:1.26.5-bookworm
 NVIDIA_IMAGE=nvidia/cuda:13.3.0-cudnn-devel-ubi8
 DEST_DIR=/usr/local/vgpu/
 
-VERSION = v0.0.1
-IMG_NAME =hami
+VERSION = v0.0.2
+IMG_NAME =vesta/hami
 IMG_TAG=${VERSION}

@@ -298,11 +298,11 @@ func InitDevices() {
 func InitDefaultDevices() {
 	configMapdata := `
 nvidia:
-  resourceCountName: "yxqiche.com/gpu"
-  resourceMemoryName: "yxqiche.com/gpumem"
-  resourceMemoryPercentageName: "yxqiche.com/gpumem-percentage"
-  resourceCoreName: "yxqiche.com/gpucores"
-  resourcePriorityName: "yxqiche.com/priority"
+  resourceCountName: "vesta.nvidia/gpu"
+  resourceMemoryName: "vesta.nvidia/gpumem"
+  resourceMemoryPercentageName: "vesta.nvidia/gpumem-percentage"
+  resourceCoreName: "vesta.nvidia/gpucores"
+  resourcePriorityName: "vesta.nvidia/priority"
   overwriteEnv: false
   defaultMemory: 0
   defaultCores: 0

@@ -18,7 +18,7 @@ spec:
       nodeName: hgx01
       containers:
         - name: vst-metrics-hami-exporter
-          image: hub.innerstar.com/vesta/vst-metrics-hami-exporter:v0.1.0
+          image: hub.innerstar.com/vesta.nvidia/vst-metrics-hami-exporter:v0.1.0
           imagePullPolicy: IfNotPresent
           args:
             - "--path.sysclassinfiniband=/host-sys/class/infiniband"

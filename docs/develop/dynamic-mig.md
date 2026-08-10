@@ -27,9 +27,9 @@ apiVersion: v1
 data:
   device-config.yaml: |
     nvidia:
-      resourceCountName: yxqiche.com/gpu
-      resourceMemoryName: yxqiche.com/gpumem
-      resourceCoreName: yxqiche.com/gpucores
+      resourceCountName: vesta.nvidia/gpu
+      resourceMemoryName: vesta.nvidia/gpumem
+      resourceCoreName: vesta.nvidia/gpucores
       knownMigGeometries:
       - models: [ "A30" ]
         allowedGeometries:
@@ -115,7 +115,7 @@ data:
 ## Examples
 
 Dynamic mig is compatible with hami tasks, as the example below: 
-Just Setting `yxqiche.com/gpu` and `yxqiche.com/gpumem`.
+Just Setting `vesta.nvidia/gpu` and `vesta.nvidia/gpumem`.
 
 ```yaml
 apiVersion: v1
@@ -129,8 +129,8 @@ spec:
       command: ["bash", "-c", "sleep 86400"]
       resources:
         limits:
-          yxqiche.com/gpu: 2 # requesting 2 vGPUs
-          yxqiche.com/gpumem: 8000 # Each vGPU contains 8000m device memory （Optional,Integer)
+          vesta.nvidia/gpu: 2 # requesting 2 vGPUs
+          vesta.nvidia/gpumem: 8000 # Each vGPU contains 8000m device memory （Optional,Integer)
 ```
 
 A task can decide only to use `mig` or `hami-core` by setting `annotations.nvidia.com/vgpu-mode` to corresponding value, as the example below shows:

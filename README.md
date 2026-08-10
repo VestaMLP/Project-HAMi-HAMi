@@ -69,8 +69,8 @@ HAMi lets workloads request only the accelerator resources they need. For exampl
 ```yaml
 resources:
   limits:
-    yxqiche.com/gpu: 1
-    yxqiche.com/gpumem: 3000
+    vesta.nvidia/gpu: 1
+    vesta.nvidia/gpumem: 3000
 ```
 
 The workload sees the allocated device resources inside the container, while HAMi coordinates scheduling, allocation, and isolation.
