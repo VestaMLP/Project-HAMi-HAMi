@@ -19,18 +19,17 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/Project-HAMi/HAMi/pkg/device"
-	"github.com/Project-HAMi/HAMi/pkg/device/nvidia"
 	"github.com/Project-HAMi/HAMi/pkg/scheduler/config"
 )
 
@@ -87,15 +86,13 @@ func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Res
 			ci, ctr.Name, ctr.Resources.Limits, ctr.Resources.Requests)
 	}
 
+	klog.V(5).Infof(template, pod.Namespace, pod.Name, pod.UID)
+	privilegedName, hasPrivileged := privilegedContainerName(pod)
 	hasResource := false
-	for idx, ctr := range pod.Spec.Containers {
-		c := &pod.Spec.Containers[idx]
-		if ctr.SecurityContext != nil {
-			if ctr.SecurityContext.Privileged != nil && *ctr.SecurityContext.Privileged {
-				klog.Warningf(template+" - Denying admission as container %s is privileged", req.Namespace, req.Name, req.UID, c.Name)
-				continue
-			}
-		}
+
+	// 1. Process InitContainers
+	for idx := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[idx]
 		for _, val := range device.GetDevices() {
 			found, err := val.MutateAdmission(c, pod)
 			if err != nil {
@@ -104,6 +101,22 @@ func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Res
 			}
 			hasResource = hasResource || found
 		}
+	}
+
+	for idx := range pod.Spec.Containers {
+		c := &pod.Spec.Containers[idx]
+		for _, val := range device.GetDevices() {
+			found, err := val.MutateAdmission(c, pod)
+			if err != nil {
+				klog.Errorf("validating pod failed:%s", err.Error())
+				return admission.Errored(http.StatusInternalServerError, err)
+			}
+			hasResource = hasResource || found
+		}
+	}
+	if hasPrivileged && hasResource {
+		klog.Warningf(template+" - Denying admission as container %s is privileged", pod.Namespace, pod.Name, pod.UID, privilegedName)
+		return admission.Denied(fmt.Sprintf("container %s is privileged", privilegedName))
 	}
 
 	if !hasResource {
@@ -115,7 +128,7 @@ func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Res
 			return admission.Denied("pod has node assigned")
 		}
 	}
-	if !fitResourceQuota(pod, req.Namespace, req.Name, req.UID) {
+	if !fitResourceQuota(pod) {
 		return admission.Denied("exceeding resource quota")
 	}
 	marshaledPod, err := json.Marshal(pod)
@@ -126,48 +139,69 @@ func (h *webhook) Handle(_ context.Context, req admission.Request) admission.Res
 	return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 }
 
-func fitResourceQuota(pod *corev1.Pod, namespace, name string, uid types.UID) bool {
+func privilegedContainerName(pod *corev1.Pod) (string, bool) {
+	for _, ctr := range pod.Spec.InitContainers {
+		if isPrivilegedContainer(&ctr) {
+			return ctr.Name, true
+		}
+	}
+	for _, ctr := range pod.Spec.Containers {
+		if isPrivilegedContainer(&ctr) {
+			return ctr.Name, true
+		}
+	}
+	return "", false
+}
+
+func isPrivilegedContainer(ctr *corev1.Container) bool {
+	return ctr.SecurityContext != nil &&
+		ctr.SecurityContext.Privileged != nil &&
+		*ctr.SecurityContext.Privileged
+}
+
+func fitResourceQuota(pod *corev1.Pod) bool {
 	for deviceName, dev := range device.GetDevices() {
-		if deviceName != nvidia.NvidiaGPUDevice {
+		resourceNames := dev.GetResourceNames()
+		if len(resourceNames.ResourceMemoryName) == 0 && len(resourceNames.ResourceCoreName) == 0 {
+			// Nothing this backend exposes can carry a quota.
 			continue
 		}
-		memoryFactor := nvidia.MemoryFactor
-		resourceNames := dev.GetResourceNames()
-		resourceName := corev1.ResourceName(resourceNames.ResourceCountName)
-		memResourceName := corev1.ResourceName(resourceNames.ResourceMemoryName)
-		coreResourceName := corev1.ResourceName(resourceNames.ResourceCoreName)
-		var memoryReq int64 = 0
-		var coresReq int64 = 0
-		getRequest := func(ctr *corev1.Container, resName corev1.ResourceName) (int64, bool) {
-			v, ok := ctr.Resources.Limits[resName]
-			if !ok {
-				v, ok = ctr.Resources.Requests[resName]
+
+		// Ask the backend what the pod is requesting rather than reading the
+		// container spec here. It applies its own memory factor, defaults and
+		// template rounding, which is what the scheduler later records as used,
+		// so this keeps admission and the scheduler on the same numbers.
+		var appMemoryReq, appCoresReq int64
+		for i := range pod.Spec.Containers {
+			req := dev.GenerateResourceRequests(&pod.Spec.Containers[i])
+			if req.Nums == 0 {
+				continue
 			}
-			if ok {
-				if n, ok := v.AsInt64(); ok {
-					return n, true
-				}
+			appMemoryReq += int64(req.Memreq) * int64(req.Nums)
+			appCoresReq += int64(req.Coresreq) * int64(req.Nums)
+		}
+
+		// Init containers run sequentially, so the pod's effective request is
+		// max(sum(app containers), max(init containers)).
+		var initMemoryReq, initCoresReq int64
+		for i := range pod.Spec.InitContainers {
+			req := dev.GenerateResourceRequests(&pod.Spec.InitContainers[i])
+			if req.Nums == 0 {
+				continue
 			}
-			return 0, false
+			initMemoryReq = max(initMemoryReq, int64(req.Memreq)*int64(req.Nums))
+			initCoresReq = max(initCoresReq, int64(req.Coresreq)*int64(req.Nums))
 		}
-		for _, ctr := range pod.Spec.Containers {
-			req, ok := getRequest(&ctr, resourceName)
-			if ok {
-				if memReq, ok := getRequest(&ctr, memResourceName); ok {
-					memoryReq += memReq * req
-				}
-				if coreReq, ok := getRequest(&ctr, coreResourceName); ok {
-					coresReq += coreReq * req
-				}
-			}
+
+		memoryReq := max(appMemoryReq, initMemoryReq)
+		coresReq := max(appCoresReq, initCoresReq)
+		if memoryReq == 0 && coresReq == 0 {
+			continue
 		}
-		if memoryFactor > 1 {
-			oriMemReq := memoryReq
-			memoryReq = memoryReq * int64(memoryFactor)
-			klog.V(5).Infof("Adjusting memory request for quota check: oriMemReq %d, memoryReq %d, factor %d", oriMemReq, memoryReq, memoryFactor)
-		}
-		if !device.GetLocalCache().FitQuota(pod.Namespace, memoryReq, memoryFactor, coresReq, deviceName) {
-			klog.Infof(template+" - Denying admission", namespace, name, uid)
+
+		klog.V(5).Infof("Checking quota for device %s: memory %d, cores %d, factor %d", deviceName, memoryReq, coresReq, resourceNames.MemoryFactor)
+		if !device.GetLocalCache().FitQuota(pod.Namespace, memoryReq, resourceNames.MemoryFactor, coresReq, deviceName) {
+			klog.Infof(template+" - Denying admission", pod.Namespace, pod.Name, pod.UID)
 			return false
 		}
 	}

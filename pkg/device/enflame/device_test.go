@@ -18,6 +18,7 @@ package enflame
 
 import (
 	"encoding/json"
+	"math"
 	"strings"
 	"testing"
 
@@ -166,6 +167,7 @@ func TestFit_SelectProfileByRequest(t *testing.T) {
 			Used:     0,
 			Totalmem: 40960,
 			Type:     EnflameVGCUDevice,
+			Health:   true,
 			CustomInfo: map[string]any{
 				"minor": "0",
 				"index": "0",
@@ -202,6 +204,7 @@ func TestFit_SelectProfileByMemoryCoreRequest(t *testing.T) {
 			Used:     0,
 			Totalmem: 40960,
 			Type:     EnflameVGCUDevice,
+			Health:   true,
 			CustomInfo: map[string]any{
 				"minor": "0",
 				"index": "0",
@@ -288,6 +291,7 @@ func TestFit_MutexRejectsUsedDevice(t *testing.T) {
 			Used:     1,
 			Totalmem: 40960,
 			Type:     EnflameVGCUDevice,
+			Health:   true,
 			CustomInfo: map[string]any{
 				"minor": "0",
 				"index": "0",
@@ -308,6 +312,38 @@ func TestFit_MutexRejectsUsedDevice(t *testing.T) {
 	fit, _, reason := dev.Fit(devices, req, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: annos}}, &device.NodeInfo{}, &device.PodDevices{})
 	assert.Equal(t, fit, false)
 	assert.Equal(t, reason, "1/1 ExclusiveDeviceAllocateConflict")
+}
+
+func TestFit_UnhealthyDeviceRejected(t *testing.T) {
+	dev := InitEnflameDevice(EnflameConfig{ResourceNameDRSGCU: "enflame.com/drs-gcu"})
+	devices := []*device.DeviceUsage{
+		{
+			ID:       "node-a-enflame-drs-0",
+			Index:    0,
+			Count:    6,
+			Used:     0,
+			Totalmem: 40960,
+			Type:     EnflameVGCUDevice,
+			Health:   false,
+			CustomInfo: map[string]any{
+				"minor": "0",
+				"index": "0",
+				"profiles": map[string]string{
+					"1g.6gb":  "0",
+					"3g.20gb": "1",
+					"6g.40gb": "2",
+				},
+			},
+		},
+	}
+	req := device.ContainerDeviceRequest{
+		Nums:   1,
+		Type:   EnflameVGCUDevice,
+		Memreq: 3,
+	}
+	fit, _, reason := dev.Fit(devices, req, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Assert(t, strings.Contains(reason, "CardNotHealth"))
 }
 
 func TestPatchAnnotations_DRSFields(t *testing.T) {
@@ -357,4 +393,104 @@ func TestPatchAnnotations_DRSFields(t *testing.T) {
 	assert.Equal(t, assigned["pod-gcu-example1"].Request, int32(3))
 	assert.Equal(t, assigned["pod-gcu-example1"].ProfileName, "3g.20gb")
 	assert.Equal(t, assigned["pod-gcu-example1"].ProfileID, "1")
+}
+
+func TestClampToInt32(t *testing.T) {
+	assert.Equal(t, clampToInt32(5), int32(5))
+	assert.Equal(t, clampToInt32(math.MaxInt64), int32(math.MaxInt32))
+	assert.Equal(t, clampToInt32(math.MinInt64), int32(math.MinInt32))
+}
+
+func TestAddResourceUsage_ClampsOnOverflow(t *testing.T) {
+	dev := &EnflameDevices{}
+	n := &device.DeviceUsage{}
+	ctr := &device.ContainerDevice{
+		CustomInfo: map[string]any{"drsSlice": math.MaxInt32},
+	}
+
+	err := dev.AddResourceUsage(&corev1.Pod{}, n, ctr)
+	assert.NilError(t, err)
+	assert.Equal(t, n.Used, int32(math.MaxInt32))
+
+	err = dev.AddResourceUsage(&corev1.Pod{}, n, ctr)
+	assert.NilError(t, err)
+	assert.Equal(t, n.Used, int32(math.MaxInt32))
+}
+
+func TestParseDRSCapacity_RejectsNaNAndInf(t *testing.T) {
+	_, err := parseDRSCapacity(math.NaN())
+	assert.Assert(t, err != nil)
+
+	_, err = parseDRSCapacity(math.Inf(1))
+	assert.Assert(t, err != nil)
+
+	_, err = parseDRSCapacity(1e300)
+	assert.Assert(t, err != nil)
+
+	capacity, err := parseDRSCapacity(float64(42))
+	assert.NilError(t, err)
+	assert.Equal(t, capacity, int32(42))
+
+	capacity, err = parseDRSCapacity("2147483648")
+	assert.NilError(t, err)
+	assert.Equal(t, capacity, int32(math.MaxInt32))
+}
+
+func TestReadCustomInfoInt_RejectsNaNAndInf(t *testing.T) {
+	assert.Equal(t, readCustomInfoInt(map[string]any{"k": math.NaN()}, "k"), 0)
+	assert.Equal(t, readCustomInfoInt(map[string]any{"k": math.Inf(-1)}, "k"), 0)
+	assert.Equal(t, readCustomInfoInt(map[string]any{"k": 1e300}, "k"), 0)
+	assert.Equal(t, readCustomInfoInt(map[string]any{"k": float64(7)}, "k"), 7)
+	assert.Equal(t, readCustomInfoInt(map[string]any{"k": "7"}, "k"), 7)
+}
+
+func TestAddResourceUsage_ClampsOversizedSliceString(t *testing.T) {
+	dev := &EnflameDevices{}
+	n := &device.DeviceUsage{}
+	ctr := &device.ContainerDevice{
+		CustomInfo: map[string]any{"drsSlice": "2147483648"},
+	}
+
+	err := dev.AddResourceUsage(&corev1.Pod{}, n, ctr)
+	assert.NilError(t, err)
+	assert.Equal(t, n.Used, int32(math.MaxInt32))
+}
+
+func TestFit_OversizedProfileRejected(t *testing.T) {
+	dev := InitEnflameDevice(EnflameConfig{ResourceNameDRSGCU: "enflame.com/drs-gcu"})
+	devices := []*device.DeviceUsage{
+		{
+			ID:       "node-a-enflame-drs-0",
+			Index:    0,
+			Count:    6,
+			Used:     0,
+			Totalmem: 40960,
+			Type:     EnflameVGCUDevice,
+			CustomInfo: map[string]any{
+				"minor":    "0",
+				"index":    "0",
+				"profiles": map[string]string{"4294967299g.4294967299gb": "0"},
+			},
+		},
+	}
+	req := device.ContainerDeviceRequest{Nums: 1, Type: EnflameVGCUDevice, Memreq: 3, MemPercentagereq: 101}
+	fit, result, _ := dev.Fit(devices, req, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Equal(t, len(result[EnflameVGCUDevice]), 0)
+
+	devices[0].CustomInfo["profiles"] = map[string]string{"4294967299g.20gb": "0"}
+	fit, result, _ = dev.Fit(devices, req, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Equal(t, len(result[EnflameVGCUDevice]), 0)
+
+	devices[0].CustomInfo["profiles"] = map[string]string{"2g.4294967299gb": "0"}
+	fit, result, _ = dev.Fit(devices, req, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Equal(t, len(result[EnflameVGCUDevice]), 0)
+
+	devices[0].CustomInfo["maxSlice"] = "1"
+	devices[0].CustomInfo["profiles"] = map[string]string{"2147483647g.20gb": "0"}
+	fit, result, _ = dev.Fit(devices, req, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{}}}, &device.NodeInfo{}, &device.PodDevices{})
+	assert.Equal(t, fit, false)
+	assert.Equal(t, len(result[EnflameVGCUDevice]), 0)
 }
