@@ -51,6 +51,9 @@ const (
 	MthreadsPredicateTime    = "mthreads.com/predicate-time"
 	coresPerMthreadsGPU      = 16
 	memoryPerMthreadsGPU     = 96
+	// MemoryFactor converts the vmemory unit used in the pod spec into the MiB
+	// HAMi accounts internally. One mthreads vmemory unit is 512 MiB.
+	MemoryFactor = 512
 )
 
 var (
@@ -117,7 +120,7 @@ func (dev *MthreadsDevices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod
 			memnum, _ := mem.AsInt64()
 			found := slices.Contains(legalMemoryslices, memnum)
 			if !found {
-				return true, errors.New("sGPU memory request value is invalid, valid values are [1, 2, 4, 8, 16, 32, 64, 96]")
+				return true, errors.New("sGPU memory request value is invalid, valid values are [2, 4, 8, 16, 32, 64, 96]")
 			}
 		}
 	}
@@ -137,7 +140,7 @@ func (dev *MthreadsDevices) GetNodeDevices(n corev1.Node) ([]*device.DeviceInfo,
 			Index:        uint(i),
 			ID:           n.Name + "-mthreads-" + fmt.Sprint(i),
 			Count:        100,
-			Devmem:       int32(memoryTotal * 512 * coresPerMthreadsGPU / cores),
+			Devmem:       int32(memoryTotal * MemoryFactor * coresPerMthreadsGPU / cores),
 			Devcore:      coresPerMthreadsGPU,
 			Type:         MthreadsGPUDevice,
 			Numa:         0,
@@ -221,7 +224,7 @@ func (dev *MthreadsDevices) GenerateResourceRequests(ctr *corev1.Container) devi
 			if ok {
 				memnums, ok := mem.AsInt64()
 				if ok {
-					memnum = int(memnums) * 512
+					memnum = int(memnums) * MemoryFactor
 					klog.InfoS("Memory allocation calculated",
 						"container", ctr.Name,
 						"requestedMem", memnums,
@@ -292,7 +295,11 @@ func (mth *MthreadsDevices) Fit(devices []*device.DeviceUsage, request device.Co
 	for i, v := range slices.Backward(devices) {
 		dev := v
 		klog.V(4).InfoS("scoring pod", "pod", klog.KObj(pod), "device", dev.ID, "Memreq", k.Memreq, "MemPercentagereq", k.MemPercentagereq, "Coresreq", k.Coresreq, "Nums", k.Nums, "device index", i)
-
+		if !dev.Health {
+			reason[common.CardNotHealth]++
+			klog.V(5).InfoS(common.CardNotHealth, "pod", klog.KObj(pod), "device", dev.ID, "health", dev.Health)
+			continue
+		}
 		klog.V(3).InfoS("Type check", "device", dev.Type, "req", k.Type)
 		if !strings.Contains(dev.Type, k.Type) {
 			reason[common.CardTypeMismatch]++
@@ -400,5 +407,6 @@ func (dev *MthreadsDevices) GetResourceNames() device.ResourceNames {
 		ResourceCountName:  MthreadsResourceCount,
 		ResourceMemoryName: MthreadsResourceMemory,
 		ResourceCoreName:   MthreadsResourceCores,
+		MemoryFactor:       MemoryFactor,
 	}
 }

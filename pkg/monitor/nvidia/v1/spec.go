@@ -92,12 +92,23 @@ func (s Spec) DeviceMax() int {
 }
 
 func (s Spec) DeviceNum() int {
-	return int(s.sr.num)
+	return int(min(s.sr.num, uint64(maxDevices)))
+}
+
+// activeProcs returns the process slots currently in use. procnum is read from
+// the shared-memory region and may be corrupt (negative or larger than the
+// backing array); clamp it to a valid range so slicing can never panic.
+func (s Spec) activeProcs() []shrregProcSlotT {
+	n := min(max(int(s.sr.procnum), 0), len(s.sr.procs))
+	return s.sr.procs[:n]
 }
 
 func (s Spec) DeviceMemoryContextSize(idx int) uint64 {
 	v := uint64(0)
-	for _, p := range s.sr.procs[:int(s.sr.procnum)] {
+	for _, p := range s.activeProcs() {
+		if p.status == 0 {
+			continue
+		}
 		v += p.used[idx].contextSize
 	}
 	return v
@@ -105,7 +116,10 @@ func (s Spec) DeviceMemoryContextSize(idx int) uint64 {
 
 func (s Spec) DeviceMemoryModuleSize(idx int) uint64 {
 	v := uint64(0)
-	for _, p := range s.sr.procs[:int(s.sr.procnum)] {
+	for _, p := range s.activeProcs() {
+		if p.status == 0 {
+			continue
+		}
 		v += p.used[idx].moduleSize
 	}
 	return v
@@ -113,7 +127,10 @@ func (s Spec) DeviceMemoryModuleSize(idx int) uint64 {
 
 func (s Spec) DeviceMemoryBufferSize(idx int) uint64 {
 	v := uint64(0)
-	for _, p := range s.sr.procs[:int(s.sr.procnum)] {
+	for _, p := range s.activeProcs() {
+		if p.status == 0 {
+			continue
+		}
 		v += p.used[idx].bufferSize
 	}
 	return v
@@ -121,7 +138,10 @@ func (s Spec) DeviceMemoryBufferSize(idx int) uint64 {
 
 func (s Spec) DeviceMemoryOffset(idx int) uint64 {
 	v := uint64(0)
-	for _, p := range s.sr.procs[:int(s.sr.procnum)] {
+	for _, p := range s.activeProcs() {
+		if p.status == 0 {
+			continue
+		}
 		v += p.used[idx].offset
 	}
 	return v
@@ -129,7 +149,10 @@ func (s Spec) DeviceMemoryOffset(idx int) uint64 {
 
 func (s Spec) DeviceMemoryTotal(idx int) uint64 {
 	v := uint64(0)
-	for _, p := range s.sr.procs[:int(s.sr.procnum)] {
+	for _, p := range s.activeProcs() {
+		if p.status == 0 {
+			continue
+		}
 		v += p.used[idx].total
 	}
 	return v
@@ -137,17 +160,19 @@ func (s Spec) DeviceMemoryTotal(idx int) uint64 {
 
 func (s Spec) DeviceSmUtil(idx int) uint64 {
 	v := uint64(0)
-	for _, p := range s.sr.procs[:int(s.sr.procnum)] {
+	for _, p := range s.activeProcs() {
+		if p.status == 0 {
+			continue
+		}
 		v += p.deviceUtil[idx].smUtil
 	}
 	return v
 }
 
 func (s Spec) SetDeviceSmLimit(l uint64) {
-	idx := uint64(0)
-	for idx < s.sr.num {
+	n := min(s.sr.num, maxDevices)
+	for idx := range n {
 		s.sr.smLimit[idx] = l
-		idx += 1
 	}
 }
 
@@ -164,10 +189,9 @@ func (s Spec) DeviceMemoryLimit(idx int) uint64 {
 }
 
 func (s Spec) SetDeviceMemoryLimit(l uint64) {
-	idx := uint64(0)
-	for idx < s.sr.num {
+	n := min(s.sr.num, maxDevices)
+	for idx := range n {
 		s.sr.limit[idx] = l
-		idx += 1
 	}
 }
 
