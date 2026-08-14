@@ -206,10 +206,6 @@ func wholeGPUVerdictDiagnostic(candidate wholeGPUCandidate, verdict wholeGPUVerd
 		diagnostic.Status = "not-whole-gpu"
 		for _, allocated := range candidate.devices {
 			registered := nodeDevs[allocated.UUID]
-			if registered != nil && registered.Mode == nv.MigMode {
-				diagnostic.Message = fmt.Sprintf("device %s is registered as MIG", allocated.UUID)
-				return diagnostic
-			}
 			if registered != nil && allocated.Usedmem < registered.Devmem {
 				diagnostic.Message = fmt.Sprintf("device %s has allocated memory %d below registered memory %d", allocated.UUID, allocated.Usedmem, registered.Devmem)
 				return diagnostic

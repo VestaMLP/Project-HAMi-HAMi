@@ -312,11 +312,13 @@ func (l *ContainerLister) fetchNodeDevices() (map[string]*device.DeviceInfo, err
 }
 
 // evaluateContainerWholeGPU decides whether every device a container was
-// allocated is a whole physical GPU: not a MIG slice, and allocated its
-// full device memory quota. Core count is intentionally not checked — a
-// container can request fractional cores against a whole memory
-// allocation, and NVML-reported utilization would not honor that core
-// limit's semantics.
+// allocated is a whole physical GPU or a whole MIG instance. MIG instances
+// have hardware-level isolation at the instance boundary, so any container
+// holding a MIG device owns that entire instance — treat it as whole.
+// For non-MIG devices, the container must have allocated the full device
+// memory quota. Core count is intentionally not checked — a container can
+// request fractional cores against a whole memory allocation, and
+// NVML-reported utilization would not honor that core limit's semantics.
 func evaluateContainerWholeGPU(ctrDevs device.ContainerDevices, nodeDevs map[string]*device.DeviceInfo) wholeGPUVerdict {
 	if len(ctrDevs) == 0 {
 		return notWholeGPU
@@ -328,7 +330,12 @@ func evaluateContainerWholeGPU(ctrDevs device.ContainerDevices, nodeDevs map[str
 			sawIndeterminate = true
 			continue
 		}
-		if nodeDev.Mode == nv.MigMode || cd.Usedmem < nodeDev.Devmem {
+		// MIG instances are hardware-isolated at the instance boundary; any
+		// container allocated a MIG device holds the whole instance.
+		if nodeDev.Mode == nv.MigMode {
+			continue
+		}
+		if cd.Usedmem < nodeDev.Devmem {
 			return notWholeGPU
 		}
 	}

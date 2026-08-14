@@ -157,6 +157,31 @@ func TestRunWholeGPUDryRun(t *testing.T) {
 		assert.ErrorContains(t, err, "NVML initialization failed")
 	})
 
+	t.Run("treats MIG instance allocation as whole at instance level", func(t *testing.T) {
+		const migUUID = "MIG-GPU-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/0/0"
+		migNode := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: nodeName,
+				Annotations: map[string]string{nv.RegisterAnnos: device.MarshalNodeDevices([]*device.DeviceInfo{{
+					ID: migUUID, Devmem: 2000, Mode: nv.MigMode,
+				}})},
+			},
+		}
+		migPod := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "workloads", Name: "mig-pod", UID: types.UID("mig-uid"),
+				Annotations: wholeGPUAnnotation(device.ContainerDevices{{UUID: migUUID, Type: nv.NvidiaGPUDevice, Usedmem: 2000}}),
+			},
+			Spec: corev1.PodSpec{NodeName: nodeName, Containers: []corev1.Container{{Name: "trainer"}}},
+		}
+		report, err := RunWholeGPUDryRun(context.Background(), fake.NewClientset(migNode, migPod), successfulWholeGPUNVML(migUUID), nodeName, WholeGPUDryRunOptions{})
+		assert.NilError(t, err)
+		assert.Equal(t, report.ConfirmedContainers, 1)
+		assert.Equal(t, report.Containers[0].Container, "trainer")
+		assert.Equal(t, report.Containers[0].Devices[0].UUID, migUUID)
+		assert.Equal(t, len(report.Diagnostics), 0)
+	})
+
 	t.Run("returns a system error for an invalid node registry annotation", func(t *testing.T) {
 		badNode := node.DeepCopy()
 		badNode.Annotations[nv.RegisterAnnos] = "not-json"

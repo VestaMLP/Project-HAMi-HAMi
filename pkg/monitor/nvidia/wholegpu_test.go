@@ -93,10 +93,10 @@ func Test_evaluateContainerWholeGPU(t *testing.T) {
 		assert.Equal(t, evaluateContainerWholeGPU(ctrDevs, nodeDevs), confirmedWholeGPU)
 	})
 
-	t.Run("MIG mode device is never a whole GPU even at full memory", func(t *testing.T) {
+	t.Run("MIG device is confirmed whole at instance level", func(t *testing.T) {
 		ctrDevs := device.ContainerDevices{{UUID: "GPU-1", Usedmem: 8000}}
 		nodeDevs := map[string]*device.DeviceInfo{"GPU-1": {ID: "GPU-1", Devmem: 8000, Mode: nv.MigMode}}
-		assert.Equal(t, evaluateContainerWholeGPU(ctrDevs, nodeDevs), notWholeGPU)
+		assert.Equal(t, evaluateContainerWholeGPU(ctrDevs, nodeDevs), confirmedWholeGPU)
 	})
 
 	t.Run("fractional memory allocation is not a whole GPU", func(t *testing.T) {
