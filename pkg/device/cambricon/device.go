@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"math/rand"
 	"slices"
 	"strings"
@@ -41,11 +42,15 @@ import (
 const (
 	CambriconMLUDevice     = "MLU"
 	CambriconMLUCommonWord = "MLU"
-	MluMemSplitLimit       = "CAMBRICON_SPLIT_MEMS"
-	MluMemSplitIndex       = "CAMBRICON_SPLIT_VISIBLE_DEVICES"
-	MluMemSplitEnable      = "CAMBRICON_SPLIT_ENABLE"
-	MLUInUse               = "cambricon.com/use-mlutype"
-	MLUNoUse               = "cambricon.com/nouse-mlutype"
+	// MLUModelLabel is published by cambricon-k8s-device-plugin v2.0.20 and later
+	// when --node-label is enabled. See:
+	// https://github.com/Cambricon/cambricon-k8s-device-plugin/blob/v2.0.20/device-plugin/README.md#mlu-device-label-management
+	MLUModelLabel     = "Model"
+	MluMemSplitLimit  = "CAMBRICON_SPLIT_MEMS"
+	MluMemSplitIndex  = "CAMBRICON_SPLIT_VISIBLE_DEVICES"
+	MluMemSplitEnable = "CAMBRICON_SPLIT_ENABLE"
+	MLUInUse          = "cambricon.com/use-mlutype"
+	MLUNoUse          = "cambricon.com/nouse-mlutype"
 	// MLUUseUUID annotation specifies a comma-separated list of MLU UUIDs to use.
 	MLUUseUUID = "cambricon.com/use-gpuuuid"
 	// MLUNoUseUUID annotation specifies a comma-separated list of MLU UUIDs to exclude.
@@ -98,25 +103,21 @@ func (dev *CambriconDevices) CommonWord() string {
 
 func (dev *CambriconDevices) setNodeLock(node *corev1.Node) error {
 	ctx := context.Background()
-	if _, ok := node.Annotations[DsmluLockTime]; ok {
-		return fmt.Errorf("node %s is locked", node.Name)
-	}
-
 	patchedAnnotation, err := json.Marshal(
 		map[string]any{
 			"metadata": map[string]map[string]string{"annotations": {
 				DsmluLockTime: time.Now().Format(time.RFC3339),
 			}}})
 	if err != nil {
-		klog.ErrorS(err, "Failed to patch node annotation", "node", node.Name)
-		return fmt.Errorf("patch node annotation %v", err)
+		klog.ErrorS(err, "Failed to marshal node annotation", "node", node.Name)
+		return fmt.Errorf("marshal node annotation: %w", err)
 	}
 
-	_, err = client.GetClient().CoreV1().Nodes().Patch(ctx, node.Name, types.StrategicMergePatchType, patchedAnnotation, metav1.PatchOptions{})
+	_, err = client.GetClient().CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patchedAnnotation, metav1.PatchOptions{})
 	for i := 0; i < retry && err != nil; i++ {
 		klog.ErrorS(err, "Failed to patch node annotation", "node", node.Name, "retry", i)
 		time.Sleep(time.Duration(rand.Intn(i+1)) * 10 * time.Millisecond)
-		_, err = client.GetClient().CoreV1().Nodes().Patch(ctx, node.Name, types.StrategicMergePatchType, patchedAnnotation, metav1.PatchOptions{})
+		_, err = client.GetClient().CoreV1().Nodes().Patch(ctx, node.Name, types.MergePatchType, patchedAnnotation, metav1.PatchOptions{})
 	}
 	if err != nil {
 		return fmt.Errorf("setNodeLock exceeds retry count %d", retry)
@@ -126,14 +127,7 @@ func (dev *CambriconDevices) setNodeLock(node *corev1.Node) error {
 }
 
 func (dev *CambriconDevices) LockNode(n *corev1.Node, p *corev1.Pod) error {
-	found := false
-	for _, val := range p.Spec.Containers {
-		if (dev.GenerateResourceRequests(&val).Nums) > 0 {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !device.PodRequiresDevice(dev, p) {
 		return nil
 	}
 	if _, ok := n.Annotations[DsmluLockTime]; !ok {
@@ -156,27 +150,48 @@ func (dev *CambriconDevices) LockNode(n *corev1.Node, p *corev1.Pod) error {
 }
 
 func (dev *CambriconDevices) ReleaseNodeLock(n *corev1.Node, p *corev1.Pod) error {
-	if n.Annotations == nil {
+	ctx := context.Background()
+	nodeName := n.Name
+
+	current, err := client.GetClient().CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get node for lock release: %w", err)
+	}
+	if current.Annotations == nil {
 		return nil
 	}
-	if _, ok := n.Annotations[DsmluLockTime]; !ok {
-		klog.InfoS("Node lock not set", "node", n.Name)
+	if _, ok := current.Annotations[DsmluLockTime]; !ok {
+		klog.InfoS("Node lock not set", "node", nodeName)
 		return nil
 	}
 
-	newNode := n.DeepCopy()
-	delete(newNode.Annotations, DsmluLockTime)
-	_, err := client.GetClient().CoreV1().Nodes().Update(context.Background(), newNode, metav1.UpdateOptions{})
+	patchData, err := json.Marshal(
+		map[string]any{
+			"metadata": map[string]map[string]any{"annotations": {
+				DsmluLockTime: nil,
+			}}})
+	if err != nil {
+		return fmt.Errorf("marshal patch for lock release: %w", err)
+	}
+
+	_, err = client.GetClient().CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patchData, metav1.PatchOptions{})
 	for i := 0; i < retry && err != nil; i++ {
-		klog.ErrorS(err, "Failed to patch node annotation", "node", n.Name, "retry", i)
+		klog.ErrorS(err, "Failed to release node lock", "node", nodeName, "retry", i)
 		time.Sleep(time.Duration(rand.Intn(i+1)) * 10 * time.Millisecond)
-		_, err = client.GetClient().CoreV1().Nodes().Update(context.Background(), newNode, metav1.UpdateOptions{})
+
+		current, err = client.GetClient().CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to re-get node during release retry: %w", err)
+		}
+		if current.Annotations == nil || current.Annotations[DsmluLockTime] == "" {
+			return nil
+		}
+		_, err = client.GetClient().CoreV1().Nodes().Patch(ctx, nodeName, types.MergePatchType, patchData, metav1.PatchOptions{})
 	}
 	if err != nil {
 		return fmt.Errorf("releaseNodeLock exceeds retry count %d", retry)
 	}
-	delete(n.Annotations, DsmluLockTime)
-	klog.InfoS("Node lock released", "node", n.Name)
+	klog.InfoS("Node lock released", "node", nodeName)
 	return nil
 }
 
@@ -196,6 +211,10 @@ func (dev *CambriconDevices) GetNodeDevices(n corev1.Node) ([]*device.DeviceInfo
 		return []*device.DeviceInfo{}, fmt.Errorf("device not found %s", MLUResourceCores)
 	}
 	memoryTotal, _ := n.Status.Capacity.Name(corev1.ResourceName(MLUResourceMemory), resource.DecimalSI).AsInt64()
+	mluType := strings.TrimSpace(n.Labels[MLUModelLabel])
+	if !strings.Contains(strings.ToUpper(mluType), CambriconMLUDevice) {
+		mluType = CambriconMLUDevice
+	}
 	for int64(i)*100 < cards {
 		nodedevices = append(nodedevices, &device.DeviceInfo{
 			Index:        uint(i),
@@ -203,7 +222,7 @@ func (dev *CambriconDevices) GetNodeDevices(n corev1.Node) ([]*device.DeviceInfo
 			Count:        100,
 			Devmem:       int32(memoryTotal * MemoryFactor * 100 / cards),
 			Devcore:      100,
-			Type:         CambriconMLUDevice,
+			Type:         mluType,
 			Numa:         0,
 			Health:       true,
 			DeviceVendor: CambriconMLUCommonWord,
@@ -224,7 +243,12 @@ func (dev *CambriconDevices) MutateAdmission(ctr *corev1.Container, p *corev1.Po
 
 func (dev *CambriconDevices) checkType(annos map[string]string, d device.DeviceUsage, n device.ContainerDeviceRequest) (bool, bool, bool) {
 	if strings.Compare(n.Type, CambriconMLUDevice) == 0 {
-		return true, true, false
+		model := strings.TrimSpace(d.Type)
+		constrained := strings.TrimSpace(annos[MLUInUse]) != "" || strings.TrimSpace(annos[MLUNoUse]) != ""
+		if constrained && (model == "" || strings.EqualFold(model, CambriconMLUDevice)) {
+			return true, false, false
+		}
+		return true, device.CheckType(annos, d.Type, MLUInUse, MLUNoUse), false
 	}
 	return false, false, false
 }
@@ -243,6 +267,10 @@ func (dev *CambriconDevices) GenerateResourceRequests(ctr *corev1.Container) dev
 	}
 	if ok {
 		if n, ok := v.AsInt64(); ok {
+			if n <= 0 || n > math.MaxInt32 {
+				klog.ErrorS(nil, "cambricon device count request is out of range", "container", ctr.Name, "request", n)
+				return device.ContainerDeviceRequest{}
+			}
 			klog.Info("Found cambricon devices")
 			memnum := 0
 			mem, ok := ctr.Resources.Limits[mluResourceMem]
@@ -251,11 +279,14 @@ func (dev *CambriconDevices) GenerateResourceRequests(ctr *corev1.Container) dev
 			}
 			klog.Infoln("mluResourceMem", mem, "ok=", ok, "memoryname=", mluResourceMem)
 			if ok {
-				memnums, ok := mem.AsInt64()
+				memnums, parsed := mem.AsInt64()
 				klog.Infoln("mluResourceMem", mem, memnums)
-				if ok {
-					memnum = int(memnums) * MemoryFactor
+				if !parsed || memnums < 0 || memnums > int64(math.MaxInt32)/int64(MemoryFactor) {
+					klog.ErrorS(nil, "cambricon memory request is not a plain integer within the int32 range; rejecting to avoid silent under-allocation",
+						"container", ctr.Name)
+					return device.ContainerDeviceRequest{}
 				}
+				memnum = int(memnums) * MemoryFactor
 			}
 			corenum := int32(100)
 			core, ok := ctr.Resources.Limits[mluResourceCores]
@@ -264,9 +295,11 @@ func (dev *CambriconDevices) GenerateResourceRequests(ctr *corev1.Container) dev
 			}
 			if ok {
 				corenums, ok := core.AsInt64()
-				if ok {
-					corenum = int32(corenums)
+				if !ok || corenums < 0 || corenums > 100 {
+					klog.ErrorS(nil, "cambricon core request is out of range (must be 0-100)", "container", ctr.Name, "request", core.String())
+					return device.ContainerDeviceRequest{}
 				}
+				corenum = int32(corenums)
 			}
 
 			mempnum := 0
@@ -362,7 +395,11 @@ func (cam *CambriconDevices) Fit(devices []*device.DeviceUsage, request device.C
 	var tmpDevs map[string]device.ContainerDevices
 	tmpDevs = make(map[string]device.ContainerDevices)
 	reason := make(map[string]int)
-	isMutex := util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod) == util.GPUSchedulerPolicyMutex.String()
+	if k.Coresreq > 100 || k.Coresreq < 0 {
+		klog.ErrorS(nil, "core limit out of range (must be 0-100)", "pod", klog.KObj(pod), "coresreq", k.Coresreq)
+		return false, tmpDevs, "core limit out of range"
+	}
+	isMutex := util.PolicyContains(util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod), util.GPUSchedulerPolicyMutex)
 	for i, v := range slices.Backward(devices) {
 		dev := v
 		klog.V(4).InfoS("scoring pod", "pod", klog.KObj(pod), "device", dev.ID, "Memreq", k.Memreq, "MemPercentagereq", k.MemPercentagereq, "Coresreq", k.Coresreq, "Nums", k.Nums, "device index", i)
@@ -402,11 +439,6 @@ func (cam *CambriconDevices) Fit(devices []*device.DeviceUsage, request device.C
 			reason[common.ExclusiveDeviceAllocateConflict]++
 			klog.V(5).InfoS(common.ExclusiveDeviceAllocateConflict, "pod", klog.KObj(pod), "device", dev.ID, "device index", i, "used", dev.Used)
 			continue
-		}
-		if k.Coresreq > 100 {
-			klog.ErrorS(nil, "core limit can't exceed 100", "pod", klog.KObj(pod), "device", dev.ID)
-			k.Coresreq = 100
-			//return false, tmpDevs
 		}
 		if k.Memreq > 0 {
 			memreq = k.Memreq

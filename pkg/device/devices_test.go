@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"gotest.tools/v3/assert"
@@ -43,6 +44,235 @@ func TestEmptyContainerDevicesCoding(t *testing.T) {
 	fmt.Println(s)
 	cd2, _ := DecodeContainerDevices(s)
 	assert.DeepEqual(t, cd1, cd2)
+}
+
+func TestDecodeContainerDevices(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		want        ContainerDevices
+		expectError bool
+	}{
+		{
+			name:        "empty string returns empty ContainerDevices",
+			input:       "",
+			want:        ContainerDevices{},
+			expectError: false,
+		},
+		{
+			name:        "trailing delimiters only returns empty ContainerDevices",
+			input:       ":::",
+			want:        ContainerDevices{},
+			expectError: false,
+		},
+		{
+			name:  "valid single device",
+			input: "GPU-8dcd427f-483b-b48f-d7e5-75fb19a52b76,NVIDIA,500,3:",
+			want: ContainerDevices{
+				{
+					UUID:      "GPU-8dcd427f-483b-b48f-d7e5-75fb19a52b76",
+					Type:      "NVIDIA",
+					Usedmem:   500,
+					Usedcores: 3,
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:  "valid single device with zero resources",
+			input: "GPU-zero,NVIDIA,0,0:",
+			want: ContainerDevices{
+				{
+					UUID:      "GPU-zero",
+					Type:      "NVIDIA",
+					Usedmem:   0,
+					Usedcores: 0,
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:  "multiple valid devices",
+			input: "GPU-1,NVIDIA,1000,10:GPU-2,Cambricon,2000,20:",
+			want: ContainerDevices{
+				{
+					UUID:      "GPU-1",
+					Type:      "NVIDIA",
+					Usedmem:   1000,
+					Usedcores: 10,
+				},
+				{
+					UUID:      "GPU-2",
+					Type:      "Cambricon",
+					Usedmem:   2000,
+					Usedcores: 20,
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:  "optional slots field is decoded",
+			input: "GPU-1,NVIDIA,1000,10,3:",
+			want: ContainerDevices{
+				{
+					UUID:      "GPU-1",
+					Type:      "NVIDIA",
+					Usedmem:   1000,
+					Usedcores: 10,
+					Slots:     3,
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:  "fields after slots are ignored",
+			input: "GPU-1,NVIDIA,1000,10,3,extra:",
+			want: ContainerDevices{
+				{
+					UUID:      "GPU-1",
+					Type:      "NVIDIA",
+					Usedmem:   1000,
+					Usedcores: 10,
+					Slots:     3,
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:        "invalid non-numeric slots is ignored",
+			input:       "GPU-1,NVIDIA,1000,10,invalid:",
+			want:        ContainerDevices{{UUID: "GPU-1", Type: "NVIDIA", Usedmem: 1000, Usedcores: 10}},
+			expectError: false,
+		},
+		{
+			name:        "negative slots value is ignored",
+			input:       "GPU-1,NVIDIA,1000,10,-1:",
+			want:        ContainerDevices{{UUID: "GPU-1", Type: "NVIDIA", Usedmem: 1000, Usedcores: 10}},
+			expectError: false,
+		},
+		{
+			name:  "existing valid fields preserved with extra optional fields",
+			input: "GPU-1,NVIDIA,1000,10,extra1,extra2:",
+			want: ContainerDevices{
+				{
+					UUID:      "GPU-1",
+					Type:      "NVIDIA",
+					Usedmem:   1000,
+					Usedcores: 10,
+				},
+			},
+			expectError: false,
+		},
+		{
+			name:        "malformed segment without comma",
+			input:       "garbage",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "malformed segment without comma and with delimiter",
+			input:       "garbage:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "missing required fields (only 2 fields)",
+			input:       "GPU-1,NVIDIA:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "missing required fields (only 3 fields)",
+			input:       "GPU-1,NVIDIA,1000:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "empty device ID / UUID",
+			input:       ",NVIDIA,1000,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "empty device type",
+			input:       "GPU-1,,1000,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "negative memory value",
+			input:       "GPU-1,NVIDIA,-500,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "negative cores value",
+			input:       "GPU-1,NVIDIA,500,-1:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "invalid non-numeric memory",
+			input:       "GPU-1,NVIDIA,invalid,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "invalid non-numeric core",
+			input:       "GPU-1,NVIDIA,500,invalid:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "memory integer overflow",
+			input:       "GPU-1,NVIDIA,99999999999999999999999999,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "core integer overflow",
+			input:       "GPU-1,NVIDIA,500,99999999999999999999999999:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "valid device followed by malformed device fails entire decode",
+			input:       "GPU-1,NVIDIA,1000,10:malformed_segment:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "malformed device followed by valid device fails entire decode",
+			input:       "malformed_segment:GPU-1,NVIDIA,1000,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "valid device followed by negative resource fails entire decode",
+			input:       "GPU-1,NVIDIA,1000,10:GPU-2,NVIDIA,-100,10:",
+			want:        nil,
+			expectError: true,
+		},
+		{
+			name:        "negative resource followed by valid device fails entire decode",
+			input:       "GPU-1,NVIDIA,1000,-5:GPU-2,NVIDIA,1000,10:",
+			want:        nil,
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := DecodeContainerDevices(tt.input)
+			if tt.expectError {
+				assert.Assert(t, err != nil, "expected error for input %q, got nil", tt.input)
+				assert.Assert(t, got == nil, "expected nil devices on error, got %+v", got)
+			} else {
+				assert.NilError(t, err)
+				assert.DeepEqual(t, tt.want, got)
+			}
+		})
+	}
 }
 
 func TestEmptyPodDeviceCoding(t *testing.T) {
@@ -150,7 +380,7 @@ func TestPodDevicesCoding(t *testing.T) {
 			args: PodDevices{
 				"NVIDIA": PodSingleDevice{
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
 					},
 				},
 			},
@@ -158,7 +388,7 @@ func TestPodDevicesCoding(t *testing.T) {
 			want: PodDevices{
 				"NVIDIA": PodSingleDevice{
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
 					},
 					ContainerDevices{},
 				},
@@ -169,10 +399,10 @@ func TestPodDevicesCoding(t *testing.T) {
 			args: PodDevices{
 				"NVIDIA": PodSingleDevice{
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
 					},
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
 					},
 				},
 			},
@@ -180,10 +410,10 @@ func TestPodDevicesCoding(t *testing.T) {
 			want: PodDevices{
 				"NVIDIA": PodSingleDevice{
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
 					},
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
 					},
 					ContainerDevices{},
 				},
@@ -194,8 +424,8 @@ func TestPodDevicesCoding(t *testing.T) {
 			args: PodDevices{
 				"NVIDIA": PodSingleDevice{
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
-						ContainerDevice{0, "UUID2", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
+						ContainerDevice{0, "UUID2", "Type1", 1000, 30, 0, nil},
 					},
 				},
 			},
@@ -203,8 +433,8 @@ func TestPodDevicesCoding(t *testing.T) {
 			want: PodDevices{
 				"NVIDIA": PodSingleDevice{
 					ContainerDevices{
-						ContainerDevice{0, "UUID1", "Type1", 1000, 30, nil},
-						ContainerDevice{0, "UUID2", "Type1", 1000, 30, nil},
+						ContainerDevice{0, "UUID1", "Type1", 1000, 30, 0, nil},
+						ContainerDevice{0, "UUID2", "Type1", 1000, 30, 0, nil},
 					},
 					ContainerDevices{},
 				},
@@ -295,9 +525,60 @@ func Test_DecodePodDevices(t *testing.T) {
 
 func TestDecodePodDevices_BadAnnotation(t *testing.T) {
 	checklist := map[string]string{"NVIDIA": "hami.io/vgpu-devices-to-allocate"}
-	annos := map[string]string{"hami.io/vgpu-devices-to-allocate": "uuid,type,100:;"}
-	_, err := DecodePodDevices(checklist, annos)
-	assert.Assert(t, err != nil)
+	badAnnos := []struct {
+		name string
+		anno string
+	}{
+		{
+			name: "missing required fields (only 3 fields)",
+			anno: "uuid,type,100:;",
+		},
+		{
+			name: "malformed non-empty segment without comma",
+			anno: "malformed_annotation:;",
+		},
+		{
+			name: "negative memory in first container",
+			anno: "GPU-1,NVIDIA,-500,10:;",
+		},
+		{
+			name: "negative cores in second container",
+			anno: "GPU-1,NVIDIA,500,10:;GPU-2,NVIDIA,500,-1:;",
+		},
+		{
+			name: "empty UUID",
+			anno: ",NVIDIA,500,10:;",
+		},
+		{
+			name: "empty type",
+			anno: "GPU-1,,500,10:;",
+		},
+	}
+
+	for _, tt := range badAnnos {
+		t.Run(tt.name, func(t *testing.T) {
+			annos := map[string]string{"hami.io/vgpu-devices-to-allocate": tt.anno}
+			got, err := DecodePodDevices(checklist, annos)
+			assert.Assert(t, err != nil, "expected error for bad annotation %q, got nil", tt.anno)
+			assert.DeepEqual(t, got, PodDevices{})
+		})
+	}
+}
+
+func TestResourceAccounting_NegativeDecodedProtection(t *testing.T) {
+	// Proves that malformed negative allocation annotations cannot be decoded,
+	// preventing negative resource values from improperly decreasing Usedmem/Usedcores.
+	malformedAnno := "GPU-1,NVIDIA,-1000,-10:"
+	devices, err := DecodeContainerDevices(malformedAnno)
+	assert.Assert(t, err != nil, "DecodeContainerDevices must reject negative values")
+	assert.Assert(t, devices == nil, "returned devices must be nil on failure")
+
+	// Ensure PodDevices decoding also fails closed
+	checklist := map[string]string{"NVIDIA": "hami.io/vgpu-devices-to-allocate"}
+	podAnnos := map[string]string{"hami.io/vgpu-devices-to-allocate": malformedAnno + ";"}
+	podDevs, err := DecodePodDevices(checklist, podAnnos)
+	assert.Assert(t, err != nil, "DecodePodDevices must reject negative values")
+	assert.DeepEqual(t, podDevs, PodDevices{})
 }
 
 func TestMarshalNodeDevices(t *testing.T) {
@@ -1037,6 +1318,59 @@ func TestGetDevicesUUIDList(t *testing.T) {
 		})
 	}
 }
+
+// TestEncodeDecodeContainerDevicesSlots covers the optional slots field: it is
+// only written when it exceeds 1, so single-slot entries keep the 4-field form.
+func TestEncodeDecodeContainerDevicesSlots(t *testing.T) {
+	tests := []struct {
+		name        string
+		cd          ContainerDevices
+		wantEncoded string
+		wantDecoded ContainerDevices
+	}{
+		{
+			name:        "multi slot entry encodes the slots field",
+			cd:          ContainerDevices{{UUID: "GPU-1", Type: "Enflame", Usedmem: 20480, Usedcores: 50, Slots: 3}},
+			wantEncoded: "GPU-1,Enflame,20480,50,3:",
+			wantDecoded: ContainerDevices{{UUID: "GPU-1", Type: "Enflame", Usedmem: 20480, Usedcores: 50, Slots: 3}},
+		},
+		{
+			name:        "single slot entry keeps the legacy four fields",
+			cd:          ContainerDevices{{UUID: "GPU-1", Type: "NVIDIA", Usedmem: 1000, Usedcores: 10, Slots: 1}},
+			wantEncoded: "GPU-1,NVIDIA,1000,10:",
+			wantDecoded: ContainerDevices{{UUID: "GPU-1", Type: "NVIDIA", Usedmem: 1000, Usedcores: 10}},
+		},
+		{
+			name:        "unset slots keeps the legacy four fields",
+			cd:          ContainerDevices{{UUID: "GPU-1", Type: "NVIDIA", Usedmem: 1000, Usedcores: 10}},
+			wantEncoded: "GPU-1,NVIDIA,1000,10:",
+			wantDecoded: ContainerDevices{{UUID: "GPU-1", Type: "NVIDIA", Usedmem: 1000, Usedcores: 10}},
+		},
+		{
+			name: "mixed entries in one container",
+			cd: ContainerDevices{
+				{UUID: "GPU-1", Type: "Enflame", Usedmem: 20480, Usedcores: 50, Slots: 3},
+				{UUID: "GPU-2", Type: "Enflame", Usedmem: 6144, Usedcores: 17},
+			},
+			wantEncoded: "GPU-1,Enflame,20480,50,3:GPU-2,Enflame,6144,17:",
+			wantDecoded: ContainerDevices{
+				{UUID: "GPU-1", Type: "Enflame", Usedmem: 20480, Usedcores: 50, Slots: 3},
+				{UUID: "GPU-2", Type: "Enflame", Usedmem: 6144, Usedcores: 17},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded := EncodeContainerDevices(tt.cd)
+			assert.Equal(t, encoded, tt.wantEncoded)
+			decoded, err := DecodeContainerDevices(encoded)
+			assert.NilError(t, err)
+			assert.DeepEqual(t, tt.wantDecoded, decoded)
+		})
+	}
+}
+
 func TestEncodeContainerDeviceType(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1722,6 +2056,36 @@ func FuzzDecodeContainerDevices(f *testing.F) {
 	})
 }
 
+func FuzzEncodeDecodeContainerDevices(f *testing.F) {
+	f.Add("GPU-uuid", "NVIDIA", int32(1024), int32(10), int32(0))
+	f.Add("GPU-uuid2", "Cambricon", int32(0), int32(0), int32(1))
+	f.Add("GPU-boundary", "NVIDIA", int32(2147483647), int32(2147483647), int32(2147483647))
+	f.Fuzz(func(t *testing.T, uuid, deviceType string, usedmem, usedcores, slots int32) {
+		if strings.ContainsAny(uuid, ",:;") || strings.ContainsAny(deviceType, ",:;") {
+			t.Skip()
+		}
+		if uuid == "" || deviceType == "" || usedmem < 0 || usedcores < 0 || slots < 0 {
+			t.Skip()
+		}
+		// Slots below 2 is not encoded, so it always decodes back as unset.
+		if slots < 2 {
+			slots = 0
+		}
+
+		want := ContainerDevices{{
+			UUID:      uuid,
+			Type:      deviceType,
+			Usedmem:   usedmem,
+			Usedcores: usedcores,
+			Slots:     slots,
+		}}
+		encoded := EncodeContainerDevices(want)
+		got, err := DecodeContainerDevices(encoded)
+		assert.NilError(t, err)
+		assert.DeepEqual(t, want, got)
+	})
+}
+
 func FuzzDecodeNodeDevices(f *testing.F) {
 	f.Add("")
 	f.Add("GPU-00552014-5c87-89ac-b1a6-7b53aa24b0ec,10,32768,100,NVIDIA-Tesla V100-PCIE-32GB,0,true:")
@@ -1845,4 +2209,107 @@ func TestDecodeNodeDevicesLegacyFormat(t *testing.T) {
 			Health:  true,
 		},
 	}, decoded)
+}
+
+func TestPodRequiresDevice(t *testing.T) {
+	mockDev := &mockDevices{
+		resourceRequest: ContainerDeviceRequest{
+			Nums:     1,
+			Type:     "NVIDIA",
+			Memreq:   1000,
+			Coresreq: 10,
+		},
+	}
+
+	gpuCtr := corev1.Container{
+		Name: "gpu-ctr",
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				"nvidia.com/gpu": resource.MustParse("1"),
+			},
+		},
+	}
+	noGpuCtr := corev1.Container{
+		Name: "no-gpu-ctr",
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				"cpu": resource.MustParse("1"),
+			},
+		},
+	}
+
+	tests := []struct {
+		name string
+		dev  Devices
+		pod  *corev1.Pod
+		want bool
+	}{
+		{
+			name: "nil pod returns false",
+			dev:  mockDev,
+			pod:  nil,
+			want: false,
+		},
+		{
+			name: "nil dev returns false",
+			dev:  nil,
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{gpuCtr},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "no device request in init or regular containers",
+			dev:  mockDev,
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{noGpuCtr},
+					Containers:     []corev1.Container{noGpuCtr},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "regular-container-only request",
+			dev:  mockDev,
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{noGpuCtr},
+					Containers:     []corev1.Container{gpuCtr},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "init-container-only request",
+			dev:  mockDev,
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{gpuCtr},
+					Containers:     []corev1.Container{noGpuCtr},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "init and regular container requests",
+			dev:  mockDev,
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{gpuCtr},
+					Containers:     []corev1.Container{gpuCtr},
+				},
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := PodRequiresDevice(tt.dev, tt.pod)
+			assert.Equal(t, got, tt.want)
+		})
+	}
 }

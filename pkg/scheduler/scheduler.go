@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -73,11 +74,23 @@ type Scheduler struct {
 	leaseLister coordinationv1.LeaseLister
 	//Node Overview
 	overviewstatus map[string]*NodeUsage
-	eventRecorder  record.EventRecorder
-	started        uint32 // 0 = false, 1 = true
+	// printedLog records the nodes whose devices have already been logged at
+	// info level, so a re-registration logs at V(5) instead. It is pruned when
+	// a node is deleted, both to keep it bounded under node churn and so a node
+	// that returns under the same name is logged as newly added again.
+	printedLog    map[string]bool
+	eventRecorder record.EventRecorder
+	started       uint32 // 0 = false, 1 = true
 
 	lock   sync.RWMutex
-	synced bool
+	synced atomic.Bool
+
+	// allocLock serializes reservation mutations between Filter, the NUMA
+	// refit (RefitNumaAllocation), and pod updates that release init-container
+	// usage. kube-scheduler already serializes Filter calls per scheduling
+	// cycle, so in the common path this adds no contention; it exists so these
+	// paths cannot observe or produce half-applied accounting.
+	allocLock sync.Mutex
 }
 
 func NewScheduler() *Scheduler {
@@ -85,10 +98,10 @@ func NewScheduler() *Scheduler {
 	s := &Scheduler{
 		stopCh:         make(chan struct{}),
 		overviewstatus: make(map[string]*NodeUsage),
+		printedLog:     make(map[string]bool),
 		nodeNotify:     make(chan struct{}, 1),
 		leaderNotify:   make(chan struct{}, 1),
 		started:        0,
-		synced:         false,
 	}
 	s.nodeManager = newNodeManager()
 	s.podManager = device.NewPodManager()
@@ -103,9 +116,7 @@ func NewScheduler() *Scheduler {
 				}
 			},
 			OnStoppedLeading: func() {
-				s.lock.Lock()
-				defer s.lock.Unlock()
-				s.synced = false
+				s.synced.Store(false)
 			},
 		}
 		s.leaderManager = leaderelection.NewLeaderManager(config.HostName, config.LeaderElectResourceNamespace, config.LeaderElectResourceName, callbacks)
@@ -151,9 +162,15 @@ func (s *Scheduler) onAddPod(obj any) {
 		return
 	}
 	if util.IsPodTerminating(pod) {
-		klog.V(5).InfoS("Pod is terminating but holding locks, preserving cache", "pod", pod.Name)
-		s.podManager.UpdatePod(pod)
-		return
+		// A terminating pod still holds its devices. When it is already
+		// cached, refresh the object; when it is not (the informer's initial
+		// sync after a scheduler restart replays it as an add), fall through
+		// so its usage is accounted instead of silently dropped.
+		if _, cached := s.podManager.GetPod(pod); cached {
+			klog.V(5).InfoS("Pod is terminating but holding locks, preserving cache", "pod", pod.Name)
+			s.podManager.UpdatePod(pod)
+			return
+		}
 	}
 
 	rawDevices, err := device.DecodePodDevices(device.SupportDevices, pod.Annotations)
@@ -189,9 +206,22 @@ func (s *Scheduler) onUpdatePod(oldObj, newObj any) {
 	}
 
 	if util.IsPodTerminating(newPod) {
+		// Same as onAddPod: a resync update for a terminating pod that is
+		// missing from the cache must be accounted, not dropped.
+		if _, cached := s.podManager.GetPod(newPod); !cached {
+			s.onAddPod(newPod)
+			return
+		}
 		s.podManager.UpdatePod(newPod)
 		return
 	}
+
+	// RefitNumaAllocation reads the release flag, devices, and quota as one
+	// accounting snapshot. Keep the normal update and the one-time init-usage
+	// transition in the same critical section so a refit cannot commit from a
+	// stale pre-release snapshot after this handler records steady-state usage.
+	s.allocLock.Lock()
+	defer s.allocLock.Unlock()
 
 	pi, exists := s.podManager.GetPod(newPod)
 	if !exists {
@@ -201,22 +231,22 @@ func (s *Scheduler) onUpdatePod(oldObj, newObj any) {
 
 	s.podManager.UpdatePod(newPod)
 
-	if !pi.InitContainerResourceReleased && util.AllInitContainersSucceeded(newPod) {
+	if !pi.InitContainerResourceReleased && util.AllNonSidecarInitContainersSucceeded(newPod) {
 		rawDevices, err := device.DecodePodDevices(device.SupportDevices, newPod.Annotations)
 		if err != nil {
 			klog.ErrorS(err, "failed to decode pod devices during shrink", "pod", klog.KObj(newPod))
 			return
 		}
 
-		appOnlyDevices := device.AppContainersOnlyDeviceUsage(newPod, rawDevices)
+		steadyStateDevices := device.SteadyStateDeviceUsage(newPod, rawDevices)
 
-		oldDevices, ok := s.podManager.UpdatePodDevice(newPod, appOnlyDevices)
+		oldDevices, ok := s.podManager.UpdatePodDevice(newPod, steadyStateDevices)
 		if ok {
-			s.quotaManager.ReplaceUsage(newPod, oldDevices, appOnlyDevices)
-			klog.InfoS("Init containers completed, shrunk usage",
+			s.quotaManager.ReplaceUsage(newPod, oldDevices, steadyStateDevices)
+			klog.InfoS("Non-sidecar init containers completed, shrunk usage to steady state",
 				"pod", klog.KObj(newPod),
 				"oldUsage", oldDevices,
-				"newUsage", appOnlyDevices,
+				"newUsage", steadyStateDevices,
 			)
 		}
 	}
@@ -242,18 +272,16 @@ func (s *Scheduler) onDelPod(obj any) {
 		return
 	}
 
-	_, ok = pod.Annotations[util.AssignedNodeAnnotations]
-	if !ok {
-		return
-	}
+	// Delete notifications can contain incomplete Pod objects. The cached
+	// allocation, keyed by the immutable UID, is the cleanup source of truth.
 	if pi, ok := s.podManager.TakeAndDeletePod(pod); ok {
 		s.quotaManager.RmUsage(pod, pi.Devices)
 	}
 }
 
 // onDelNode handles node delete events. It removes any in-memory per-node
-// lock bookkeeping to avoid unbounded growth when nodes are removed by
-// autoscalers or administratively.
+// lock bookkeeping and per-device health bookkeeping to avoid unbounded growth
+// when nodes are removed by autoscalers or administratively.
 func (s *Scheduler) onDelNode(obj any) {
 	// Ensure downstream consumers are notified regardless of decoding success
 	defer s.doNodeNotify()
@@ -279,10 +307,19 @@ func (s *Scheduler) onDelNode(obj any) {
 	nodelockutil.CleanupNodeLock(nodeName)
 	s.rmNode(nodeName)
 	s.cleanupNodeUsage(nodeName)
+	// Clear per-device health bookkeeping for the deleted node.
+	// Devices that track per-node state (e.g. NvidiaGPUDevices) implement
+	// NodeDeleted to prune their internal maps; others are a no-op.
+	for _, devInstance := range device.GetDevices() {
+		if nd, ok := devInstance.(*nvidia.NvidiaGPUDevices); ok {
+			nd.NodeDeleted(nodeName)
+		}
+	}
 }
 
-// cleanupNodeUsage removes the node from overviewstatus maps
-// to ensure metrics no longer report data for deleted nodes.
+// cleanupNodeUsage removes the node from the overviewstatus and printedLog maps
+// to ensure metrics no longer report data for deleted nodes, and that a node
+// recreated under the same name is logged as newly added rather than updated.
 func (s *Scheduler) cleanupNodeUsage(nodeID string) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
@@ -290,6 +327,7 @@ func (s *Scheduler) cleanupNodeUsage(nodeID string) {
 		delete(s.overviewstatus, nodeID)
 		klog.V(4).InfoS("Removed node from overviewstatus", "node", nodeID)
 	}
+	delete(s.printedLog, nodeID)
 }
 
 func (s *Scheduler) onAddQuota(obj any) {
@@ -357,14 +395,14 @@ func (s *Scheduler) Start() error {
 		DeleteFunc: s.onDelPod,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to register pod event handler: %v", err)
+		return fmt.Errorf("failed to register pod event handler: %w", err)
 	}
 	nodeEventHandlerRegistration, err := informerFactory.Core().V1().Nodes().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    func(_ any) { s.doNodeNotify() },
 		DeleteFunc: s.onDelNode,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to register node event handler: %v", err)
+		return fmt.Errorf("failed to register node event handler: %w", err)
 	}
 	resourceQuotaEventHandlerRegistration, err := informerFactory.Core().V1().ResourceQuotas().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    s.onAddQuota,
@@ -372,7 +410,7 @@ func (s *Scheduler) Start() error {
 		DeleteFunc: s.onDelQuota,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to register resource quota event handler: %v", err)
+		return fmt.Errorf("failed to register resource quota event handler: %w", err)
 	}
 
 	informerFactory.Start(s.stopCh)
@@ -410,7 +448,6 @@ func (s *Scheduler) RegisterFromNodeAnnotations() {
 
 	ticker := time.NewTicker(time.Second * 15)
 	defer ticker.Stop()
-	printedLog := map[string]bool{}
 	for {
 		select {
 		case <-s.nodeNotify:
@@ -427,11 +464,11 @@ func (s *Scheduler) RegisterFromNodeAnnotations() {
 			klog.V(5).InfoS("Scheduler not started yet, skipping ...")
 			continue
 		}
-		s.register(labelSelector, printedLog)
+		s.register(labelSelector)
 	}
 }
 
-func (s *Scheduler) register(labelSelector labels.Selector, printedLog map[string]bool) {
+func (s *Scheduler) register(labelSelector labels.Selector) {
 	// Lock here to avoid setting s.synced to false, when we lost leadership, while doing register.
 	// 1. lost leadership before register: synced will set to false in callbacks, and register will be skipped because IsLeader() returns false
 	// 2. lost leadership during or after register: synced will set to true after finishing register, and callback will set it to false again after lock is acquired by callback
@@ -463,8 +500,7 @@ func (s *Scheduler) register(labelSelector labels.Selector, printedLog map[strin
 
 			nodedevices, err := devInstance.GetNodeDevices(*val)
 			if err != nil {
-				klog.V(5).InfoS("Failed to get node devices", "nodeName", val.Name, "deviceVendor", devhandsk)
-				continue
+				klog.V(5).InfoS("Failed to get node devices", "nodeName", val.Name, "deviceVendor", devhandsk, "error", err)
 			}
 
 			health, needUpdate := devInstance.CheckHealth(devhandsk, val)
@@ -496,6 +532,22 @@ func (s *Scheduler) register(labelSelector labels.Selector, printedLog map[strin
 				s.rmNodeDevices(val.Name, devhandsk)
 				continue
 			}
+			if err != nil {
+				continue
+			}
+			// GetNodeDevices succeeded but reported zero devices: the vendor plugin
+			// is healthy but no longer advertising devices on this node. Remove any
+			// stale entry so the scheduler does not keep offering capacity that no
+			// longer exists.
+			if len(nodedevices) == 0 {
+				if existingNode, getNodeErr := s.GetNode(val.Name); getNodeErr == nil {
+					if _, ok := existingNode.Devices[devhandsk]; ok {
+						klog.InfoS("Vendor reports zero devices, removing stale cache entry", "nodeName", val.Name, "deviceVendor", devhandsk)
+						s.rmNodeDevices(val.Name, devhandsk)
+					}
+				}
+				continue
+			}
 			if !needUpdate {
 				klog.V(5).InfoS("No update needed for device", "nodeName", val.Name, "deviceVendor", devhandsk)
 				continue
@@ -511,11 +563,11 @@ func (s *Scheduler) register(labelSelector labels.Selector, printedLog map[strin
 			s.addNode(val.Name, nodeInfo)
 			// Log the locally built nodeInfo; reading it back from s.nodes raced with onDelNode->rmNode.
 			if len(nodeInfo.Devices) > 0 {
-				if printedLog[val.Name] {
+				if s.printedLog[val.Name] {
 					klog.V(5).InfoS("Node device updated", "nodeName", val.Name, "deviceVendor", devhandsk, "nodeInfo", nodeInfo)
 				} else {
 					klog.InfoS("Node device added", "nodeName", val.Name, "deviceVendor", devhandsk, "nodeInfo", nodeInfo)
-					printedLog[val.Name] = true
+					s.printedLog[val.Name] = true
 				}
 			}
 		}
@@ -528,7 +580,7 @@ func (s *Scheduler) register(labelSelector labels.Selector, printedLog map[strin
 	s.overviewstatus = *overallnodeMap
 
 	// Set synced to true only after getNodeUsage() succeeds
-	s.synced = true
+	s.synced.Store(true)
 }
 
 func (s *Scheduler) updateSchedulerLabel() {
@@ -588,11 +640,17 @@ func (s *Scheduler) updateSchedulerLabel() {
 	}
 }
 
+// IsSynced returns true when the scheduler's internal node/device cache has
+// completed at least one successful sync cycle and is ready to serve requests.
+// It uses atomic lock-free reads and is safe to call from Prometheus Collect callbacks
+// without contending on the scheduler's write lock during cache refreshes.
+func (s *Scheduler) IsSynced() bool {
+	return s.synced.Load()
+}
+
 func (s *Scheduler) WaitForCacheSync(ctx context.Context) bool {
 	err := wait.PollUntilContextCancel(ctx, syncedPollPeriod, true, func(context.Context) (done bool, err error) {
-		s.lock.RLock()
-		defer s.lock.RUnlock()
-		return s.synced, nil
+		return s.synced.Load(), nil
 	})
 	if err != nil {
 		klog.ErrorS(err, "failed to poll until context cancel")
@@ -749,10 +807,14 @@ func (s *Scheduler) getNodesUsage(nodes *[]string, task *corev1.Pod) (*map[strin
 		for _, podsingleds := range p.Devices {
 			for _, ctrdevs := range podsingleds {
 				for _, udevice := range ctrdevs {
+					matched := false
 					for _, d := range node.Devices.DeviceLists {
 						deviceID := udevice.UUID
 						if d.Device.ID == deviceID {
-							d.Device.Used++
+							matched = true
+							// Raw entries carry no slot count; clamp to at least one.
+							slots := max(udevice.Slots, 1)
+							d.Device.Used += slots
 							d.Device.Usedmem += udevice.Usedmem
 							d.Device.Usedcores += udevice.Usedcores
 							d.Device.PodInfos = append(d.Device.PodInfos, p)
@@ -773,6 +835,9 @@ func (s *Scheduler) getNodesUsage(nodes *[]string, task *corev1.Pod) (*map[strin
 								d.Device.Health = false
 							}
 						}
+					}
+					if !matched {
+						klog.ErrorS(nil, "pod allocated unknown or stale device resources", "pod", klog.KRef(p.Namespace, p.Name), "nodeID", p.NodeID, "gpuUUID", udevice.UUID)
 					}
 				}
 			}
@@ -820,7 +885,13 @@ func (s *Scheduler) getNodesUsage(nodes *[]string, task *corev1.Pod) (*map[strin
 			failedNodes[nodeID] = "node unregistered"
 			continue
 		}
-		cachenodeMap[node.ID] = overallnodeMap[node.ID]
+		usage, ok := overallnodeMap[node.ID]
+		if !ok {
+			klog.V(5).InfoS("node usage not found in snapshot", "node", nodeID)
+			failedNodes[nodeID] = "node usage unavailable"
+			continue
+		}
+		cachenodeMap[node.ID] = usage
 	}
 	return &cachenodeMap, &overallnodeMap, failedNodes, nil
 }
@@ -894,16 +965,38 @@ func (s *Scheduler) cleanupStalePodAllocation(pod *corev1.Pod) {
 }
 
 func (s *Scheduler) lockAllDevices(node *corev1.Node, pod *corev1.Pod) error {
-	for _, val := range device.GetDevices() {
+	devs := device.GetDevices()
+	keys := make([]string, 0, len(devs))
+	for k := range devs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	acquired := make([]device.Devices, 0, len(keys))
+	for _, k := range keys {
+		val := devs[k]
 		if err := val.LockNode(node, pod); err != nil {
+			for _, locked := range slices.Backward(acquired) {
+				if relErr := locked.ReleaseNodeLock(node, pod); relErr != nil {
+					klog.ErrorS(relErr, "Failed to release node lock during rollback", "node", node.Name, "pod", klog.KObj(pod))
+				}
+			}
 			return err
 		}
+		acquired = append(acquired, val)
 	}
 	return nil
 }
 
 func (s *Scheduler) releaseAllDevices(node *corev1.Node, pod *corev1.Pod) {
-	for _, val := range device.GetDevices() {
+	devs := device.GetDevices()
+	keys := make([]string, 0, len(devs))
+	for k := range devs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		val := devs[k]
 		if err := val.ReleaseNodeLock(node, pod); err != nil {
 			klog.ErrorS(err, "Failed to release node lock", "node", node.Name, "pod", klog.KObj(pod))
 		}
@@ -921,7 +1014,6 @@ func (s *Scheduler) acquireNodeLocks(node *corev1.Node, pod *corev1.Pod) error {
 		if err == nil {
 			return nil
 		}
-		s.releaseAllDevices(node, pod)
 		if !nodelockutil.IsNodeLockContention(err) {
 			return err
 		}
@@ -1021,7 +1113,11 @@ func (s *Scheduler) Filter(args extenderv1.ExtenderArgs) (*extenderv1.ExtenderFi
 
 	if !hasHAMiResource {
 		klog.V(1).InfoS("Pod does not request any resources", "pod", args.Pod.Name)
+		// Simulation callers such as the cluster autoscaler send Nodes
+		// instead of NodeNames; echo both back so a pod without HAMi
+		// resources keeps every candidate node on either protocol shape.
 		return &extenderv1.ExtenderFilterResult{
+			Nodes:       args.Nodes,
 			NodeNames:   args.NodeNames,
 			FailedNodes: nil,
 			Error:       "",
@@ -1030,6 +1126,9 @@ func (s *Scheduler) Filter(args extenderv1.ExtenderArgs) (*extenderv1.ExtenderFi
 	if args.Nodes != nil {
 		return s.filterSimulation(args, resourceReqs)
 	}
+
+	s.allocLock.Lock()
+	defer s.allocLock.Unlock()
 
 	if pi, ok := s.podManager.TakeAndDeletePod(args.Pod); ok {
 		s.quotaManager.RmUsage(args.Pod, pi.Devices)

@@ -146,8 +146,8 @@ func (dev *EnflameDevices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod)
 	if hasMem && memReq <= 0 {
 		return false, fmt.Errorf("%s must be greater than 0", EnflameResourceNameGCUMemory)
 	}
-	if hasCore && (coreReq <= 0 || coreReq > 100) {
-		return false, fmt.Errorf("%s must be in range (0,100]", EnflameResourceNameGCUCore)
+	if hasCore && (coreReq < 0 || coreReq > 100) {
+		return false, fmt.Errorf("%s must be in range [0,100]", EnflameResourceNameGCUCore)
 	}
 	if hasMem {
 		memQty := ctr.Resources.Limits[corev1.ResourceName(EnflameResourceNameGCUMemory)]
@@ -255,10 +255,7 @@ func (dev *EnflameDevices) PatchAnnotations(pod *corev1.Pod, annoinput *map[stri
 				continue
 			}
 			chosen := ctrDevices[0]
-			slice := clampToInt32(readCustomInfoInt(chosen.CustomInfo, "drsSlice"))
-			if slice <= 0 {
-				slice = 1
-			}
+			slice := sliceCount(&chosen)
 			ctrName := containerNameByIndex(pod, ctridx)
 			profileName := readCustomInfoString(chosen.CustomInfo, "profileName")
 			profileID := readCustomInfoString(chosen.CustomInfo, "profileID")
@@ -350,8 +347,8 @@ func (dev *EnflameDevices) GenerateResourceRequests(ctr *corev1.Container) devic
 		klog.ErrorS(nil, "gcu memory request is too large", "container", ctr.Name, "request", memReq)
 		return device.ContainerDeviceRequest{}
 	}
-	if hasCore && coreReq > math.MaxInt32 {
-		klog.ErrorS(nil, "gcu core request is too large", "container", ctr.Name, "request", coreReq)
+	if hasCore && (coreReq < 0 || coreReq > 100) {
+		klog.ErrorS(nil, "gcu core request is out of range (must be 0-100)", "container", ctr.Name, "request", coreReq)
 		return device.ContainerDeviceRequest{}
 	}
 	klog.Info("Found enflame memory/core based request")
@@ -368,12 +365,24 @@ func (dev *EnflameDevices) ScoreNode(node *corev1.Node, podDevices device.PodSin
 	return 0
 }
 
-func (dev *EnflameDevices) AddResourceUsage(pod *corev1.Pod, n *device.DeviceUsage, ctr *device.ContainerDevice) error {
-	slice := clampToInt32(readCustomInfoInt(ctr.CustomInfo, "drsSlice"))
-	if slice <= 0 {
-		slice = 1
+// sliceCount returns the DRS slices an entry occupies. Slots is authoritative;
+// CustomInfo is the fallback for entries built before Fit recorded Slots.
+func sliceCount(ctr *device.ContainerDevice) int32 {
+	if ctr == nil {
+		return 1
 	}
-	n.Used = clampToInt32(int(n.Used) + int(slice))
+	slice := ctr.Slots
+	if slice <= 0 {
+		slice = clampToInt32(readCustomInfoInt(ctr.CustomInfo, "drsSlice"))
+	}
+	if slice <= 0 {
+		return 1
+	}
+	return slice
+}
+
+func (dev *EnflameDevices) AddResourceUsage(pod *corev1.Pod, n *device.DeviceUsage, ctr *device.ContainerDevice) error {
+	n.Used = clampToInt32(int(n.Used) + int(sliceCount(ctr)))
 	n.Usedcores += ctr.Usedcores
 	n.Usedmem += ctr.Usedmem
 	return nil
@@ -385,7 +394,11 @@ func (enf *EnflameDevices) Fit(devices []*device.DeviceUsage, request device.Con
 	klog.InfoS("Allocating device for container request", "pod", klog.KObj(pod), "card request", k)
 	tmpDevs := make(map[string]device.ContainerDevices)
 	reason := make(map[string]int)
-	isMutex := util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod) == util.GPUSchedulerPolicyMutex.String()
+	if k.Coresreq > 100 || k.Coresreq < 0 {
+		klog.ErrorS(nil, "core limit out of range (must be 0-100)", "pod", klog.KObj(pod), "coresreq", k.Coresreq)
+		return false, tmpDevs, "core limit out of range"
+	}
+	isMutex := util.PolicyContains(util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod), util.GPUSchedulerPolicyMutex)
 	profile, profileMatch := enf.selectProfileByRequest(devices, k)
 	if !profileMatch {
 		reason[common.ModeNotFit]++
@@ -405,6 +418,10 @@ func (enf *EnflameDevices) Fit(devices []*device.DeviceUsage, request device.Con
 	}
 	profileMemoryMiB := int32(profile.MemoryGB * 1024)
 	profileCorePercent := int32(profile.CorePercent)
+	// profile.Size is already range checked above, so this is the single
+	// bounded conversion reused by the slice guard and the allocation.
+	profileSlices := int32(profile.Size)
+
 	for i, v := range slices.Backward(devices) {
 		dev := v
 		klog.V(4).InfoS("scoring pod", "pod", klog.KObj(pod), "device", dev.ID, "Memreq", k.Memreq, "MemPercentagereq", k.MemPercentagereq, "Coresreq", k.Coresreq, "Nums", k.Nums, "device index", i)
@@ -425,9 +442,11 @@ func (enf *EnflameDevices) Fit(devices []*device.DeviceUsage, request device.Con
 			continue
 		}
 
-		if dev.Count <= dev.Used {
+		// The whole profile has to fit: a 3 slice profile needs 3 free slices,
+		// not just one.
+		if dev.Count-dev.Used < profileSlices {
 			reason[common.CardTimeSlicingExhausted]++
-			klog.V(5).InfoS(common.CardTimeSlicingExhausted, "pod", klog.KObj(pod), "device", dev.ID, "count", dev.Count, "used", dev.Used)
+			klog.V(5).InfoS(common.CardTimeSlicingExhausted, "pod", klog.KObj(pod), "device", dev.ID, "count", dev.Count, "used", dev.Used, "request slices", profileSlices)
 			continue
 		}
 		if isMutex && dev.Used > 0 {
@@ -454,6 +473,9 @@ func (enf *EnflameDevices) Fit(devices []*device.DeviceUsage, request device.Con
 				Type:      k.Type,
 				Usedmem:   profileMemoryMiB,
 				Usedcores: profileCorePercent,
+				// A DRS profile consumes profile.Size slices; recording it here keeps
+				// the count across the annotation round trip that drops CustomInfo.
+				Slots: profileSlices,
 				CustomInfo: map[string]any{
 					"profileName": profile.Name,
 					"profileID":   profile.ID,
@@ -582,7 +604,10 @@ func collectDRSProfiles(devices []*device.DeviceUsage) []drsProfileCandidate {
 			if size <= 0 || memGB <= 0 {
 				continue
 			}
-			corePercent := int(math.Ceil(float64(size) * 100 / float64(maxSlice)))
+			// Round down so the costs of a fully sliced device never sum past
+			// its 100 core budget; ceil left 6x1g at 102 and blocked the last
+			// advertised slice.
+			corePercent := size * 100 / maxSlice
 			seen[profileName] = drsProfileCandidate{
 				Name:        profileName,
 				ID:          profileID,
@@ -749,10 +774,18 @@ func getContainerResourceRequest(ctr *corev1.Container, resourceName corev1.Reso
 		return 0, false
 	}
 	if qty, ok := ctr.Resources.Limits[resourceName]; ok {
-		return qty.Value(), true
+		val, valid := qty.AsInt64()
+		if !valid {
+			return -1, true
+		}
+		return val, true
 	}
 	if qty, ok := ctr.Resources.Requests[resourceName]; ok {
-		return qty.Value(), true
+		val, valid := qty.AsInt64()
+		if !valid {
+			return -1, true
+		}
+		return val, true
 	}
 	return 0, false
 }

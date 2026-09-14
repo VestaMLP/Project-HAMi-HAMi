@@ -21,6 +21,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strconv"
@@ -44,16 +45,18 @@ const (
 	Ascend910NetworkWeight     = 10
 	VNPUModeAnnotation         = "huawei.com/vnpu-mode"
 	VNPUModeHamiCore           = "hami-core"
+	VNPUModeTemplate           = "template"
 	VNPUNodeSelectorAnnotation = "hami-vnpu-core"
 )
 
 type Devices struct {
-	config           VNPUConfig
-	nodeRegisterAnno string
-	useUUIDAnno      string
-	noUseUUIDAnno    string
-	handshakeAnno    string
-	hamiVnpuCore     bool
+	config                 VNPUConfig
+	nodeRegisterAnno       string
+	useUUIDAnno            string
+	noUseUUIDAnno          string
+	handshakeAnno          string
+	hamiVnpuCore           bool
+	allAscendResourceNames []corev1.ResourceName
 }
 
 type RuntimeInfo struct {
@@ -82,15 +85,20 @@ func InitDevices(vnpus VNPUs) []*Devices {
 	if !enableAscend {
 		return devs
 	}
+	allAscendResourceNames := make([]corev1.ResourceName, 0, len(vnpus.Configs))
+	for _, vnpu := range vnpus.Configs {
+		allAscendResourceNames = append(allAscendResourceNames, corev1.ResourceName(vnpu.ResourceName))
+	}
 	for _, vnpu := range vnpus.Configs {
 		commonWord := vnpu.CommonWord
 		dev := &Devices{
-			config:           vnpu,
-			nodeRegisterAnno: fmt.Sprintf("hami.io/node-register-%s", commonWord),
-			useUUIDAnno:      fmt.Sprintf("hami.io/use-%s-uuid", commonWord),
-			noUseUUIDAnno:    fmt.Sprintf("hami.io/no-use-%s-uuid", commonWord),
-			handshakeAnno:    fmt.Sprintf("hami.io/node-handshake-%s", commonWord),
-			hamiVnpuCore:     vnpus.HamiVnpuCore,
+			config:                 vnpu,
+			nodeRegisterAnno:       fmt.Sprintf("hami.io/node-register-%s", commonWord),
+			useUUIDAnno:            fmt.Sprintf("hami.io/use-%s-uuid", commonWord),
+			noUseUUIDAnno:          fmt.Sprintf("hami.io/no-use-%s-uuid", commonWord),
+			handshakeAnno:          fmt.Sprintf("hami.io/node-handshake-%s", commonWord),
+			hamiVnpuCore:           vnpus.HamiVnpuCore,
+			allAscendResourceNames: allAscendResourceNames,
 		}
 		sort.Slice(dev.config.Templates, func(i, j int) bool {
 			return dev.config.Templates[i].Memory < dev.config.Templates[j].Memory
@@ -115,10 +123,35 @@ func (dev *Devices) CommonWord() string {
 	return dev.config.CommonWord
 }
 
+func (dev *Devices) containerRequestsAnyAscendResource(ctr *corev1.Container) bool {
+	for _, name := range dev.allAscendResourceNames {
+		if _, ok := ctr.Resources.Limits[name]; ok {
+			return true
+		}
+		if _, ok := ctr.Resources.Requests[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func lastEnvValueEquals(env []corev1.EnvVar, name, value string) bool {
+	// kubelet will dedupes same-name env and the last one wins, so iterate backward
+	for _, e := range slices.Backward(env) {
+		if e.Name != name {
+			continue
+		}
+		// TODO: currently ignore the ValueFrom reference, because it's complicated to get the runtime value.
+		return e.ValueFrom == nil && e.Value == value
+	}
+	return false
+}
+
 func (dev *Devices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod) (bool, error) {
 	count, ok := ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceName)]
 	if !ok {
-		if dev.config.OverwriteEnv {
+		if dev.config.OverwriteEnv && !dev.containerRequestsAnyAscendResource(ctr) &&
+			!lastEnvValueEquals(ctr.Env, "ASCEND_VISIBLE_DEVICES", "") {
 			ctr.Env = append(ctr.Env, corev1.EnvVar{
 				Name:  "ASCEND_VISIBLE_DEVICES",
 				Value: "",
@@ -145,19 +178,27 @@ func (dev *Devices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod) (bool,
 		}
 	}
 
-	// Check if hami-core is declared
-	vnpuMode := p.Annotations[VNPUModeAnnotation]
+	vnpuMode := ""
+	if p.Annotations != nil {
+		vnpuMode = p.Annotations[VNPUModeAnnotation]
+	}
 	isHAMiCore := (vnpuMode == VNPUModeHamiCore)
 
-	// -core only applies to hami-core (soft split); on hard split the template
-	// fixes compute, so reject it here.
 	if !isHAMiCore && dev.config.ResourceCoreName != "" {
 		coreQ, ok := ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceCoreName)]
 		if !ok {
 			coreQ, ok = ctr.Resources.Requests[corev1.ResourceName(dev.config.ResourceCoreName)]
 		}
 		if ok && coreQ.Value() > 0 {
-			return false, fmt.Errorf("%s is only supported in hami-core (soft split) mode", dev.config.ResourceCoreName)
+			if vnpuMode == VNPUModeTemplate {
+				return false, fmt.Errorf("%s is only supported in hami-core (soft split) mode", dev.config.ResourceCoreName)
+			}
+			if p.Annotations == nil {
+				p.Annotations = map[string]string{}
+			}
+			p.Annotations[VNPUModeAnnotation] = VNPUModeHamiCore
+			isHAMiCore = true
+			klog.InfoS("Inferred hami-core vnpu mode from core request", "pod", klog.KObj(p), "core", coreQ.Value())
 		}
 	}
 
@@ -173,18 +214,23 @@ func (dev *Devices) MutateAdmission(ctr *corev1.Container, p *corev1.Pod) (bool,
 			}
 		}
 	}
+	// count, not reqNum: the 910C SuperPod rewrite to 2 is HAMi's module
+	// packaging rule, not a multi device request, and #2005 added 910C vNPU
+	// templates so a single device fractional request stays schedulable.
 	if count.Value() > 1 && !isHAMiCore {
 		if trimMem != dev.config.MemoryAllocatable {
 			return true, errors.New("vNPU not supported for multiple devices")
 		}
 	}
-	// Requests may be nil when the pod declares only limits; writing to a
-	// nil map panics.
-	if ctr.Resources.Requests == nil {
-		ctr.Resources.Requests = corev1.ResourceList{}
+	if dev.config.ResourceMemoryName != "" {
+		// Requests may be nil when the pod declares only limits; writing to a
+		// nil map panics.
+		if ctr.Resources.Requests == nil {
+			ctr.Resources.Requests = corev1.ResourceList{}
+		}
+		ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceMemoryName)] = resource.MustParse(fmt.Sprint(trimMem))
+		ctr.Resources.Requests[corev1.ResourceName(dev.config.ResourceMemoryName)] = resource.MustParse(fmt.Sprint(trimMem))
 	}
-	ctr.Resources.Limits[corev1.ResourceName(dev.config.ResourceMemoryName)] = resource.MustParse(fmt.Sprint(trimMem))
-	ctr.Resources.Requests[corev1.ResourceName(dev.config.ResourceMemoryName)] = resource.MustParse(fmt.Sprint(trimMem))
 
 	// Set runtime class name if it is not set by user and the runtime class name is configured
 	if p.Spec.RuntimeClassName == nil && dev.config.RuntimeClassName != "" {
@@ -255,14 +301,7 @@ func (dev *Devices) PatchAnnotations(pod *corev1.Pod, annoInput *map[string]stri
 }
 
 func (dev *Devices) LockNode(n *corev1.Node, p *corev1.Pod) error {
-	found := false
-	for _, val := range p.Spec.Containers {
-		if (dev.GenerateResourceRequests(&val).Nums) > 0 {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !device.PodRequiresDevice(dev, p) {
 		return nil
 	}
 
@@ -270,14 +309,7 @@ func (dev *Devices) LockNode(n *corev1.Node, p *corev1.Pod) error {
 }
 
 func (dev *Devices) ReleaseNodeLock(n *corev1.Node, p *corev1.Pod) error {
-	found := false
-	for _, val := range p.Spec.Containers {
-		if (dev.GenerateResourceRequests(&val).Nums) > 0 {
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !device.PodRequiresDevice(dev, p) {
 		return nil
 	}
 
@@ -312,45 +344,58 @@ func (dev *Devices) GenerateResourceRequests(ctr *corev1.Container) device.Conta
 		klog.V(3).Infof("Counting %s devices", dev.config.CommonWord)
 		if n, ok := v.AsInt64(); ok {
 			klog.Info("Found AscendDevices devices")
+			if n <= 0 || n > math.MaxInt32 {
+				klog.ErrorS(nil, "ascend device count request is out of range", "container", ctr.Name, "request", n)
+				return device.ContainerDeviceRequest{}
+			}
 			memnum := 0
 			mem, ok := ctr.Resources.Limits[ascendResourceMem]
 			if !ok {
 				mem, ok = ctr.Resources.Requests[ascendResourceMem]
 			}
 			if ok {
+				// Negative quantities such as -1m return ok=false from AsInt64, so reject by sign first.
+				if mem.Sign() < 0 {
+					klog.ErrorS(nil, "ascend device memory request is negative", "container", ctr.Name, "request", mem.String(), "device", dev.config.CommonWord)
+					return device.ContainerDeviceRequest{}
+				}
 				memnums, ok := mem.AsInt64()
 				if ok {
+					// Ascend memory is in MB, so an over-int32 value such as a byte quantity 16Gi is a wrong-unit mistake.
+					if memnums > math.MaxInt32 {
+						klog.ErrorS(nil, "ascend device memory request is out of range; memory unit is treated as MB not Byte, so a quantity such as 16Gi is invalid, request 16384 for 16GB instead",
+							"container", ctr.Name, "request", mem.String(), "device", dev.config.CommonWord)
+						return device.ContainerDeviceRequest{}
+					}
 					if dev.config.MemoryFactor > 1 {
 						rawMemnums := memnums
+						// memnums is bounded by math.MaxInt32 and MemoryFactor is int32, so this product cannot overflow int64.
 						memnums = memnums * int64(dev.config.MemoryFactor)
+						if memnums > math.MaxInt32 {
+							klog.ErrorS(nil, "ascend device memory request overflows int32 after applying memory factor; memory unit is treated as MB not Byte",
+								"container", ctr.Name, "raw", rawMemnums, "scaled", memnums, "factor", dev.config.MemoryFactor)
+							return device.ContainerDeviceRequest{}
+						}
 						klog.V(4).Infof("Update Ascend memory request. before %d, after %d, factor %d", rawMemnums, memnums, dev.config.MemoryFactor)
 					}
-					// If "core" is requested, it explicitly indicates the use of soft-partitioning.
-					isCoreRequested := false
-					if ascendResourceCore != "" {
-						_, isCoreRequested = ctr.Resources.Limits[ascendResourceCore]
-						if !isCoreRequested {
-							_, isCoreRequested = ctr.Resources.Requests[ascendResourceCore]
-						}
-					}
-
-					if isCoreRequested {
-						// Soft-partitioning: Use the raw value directly.
-						memnum = int(memnums)
-					} else {
-						m, _ := dev.trimMemory(memnums)
-						memnum = int(m)
-					}
+					memnum = int(memnums)
 				}
 			}
 
 			// Process Core Resources
 			corenum := int32(0)
 			if ascendResourceCore != "" {
-				if cv, ok := ctr.Resources.Limits[ascendResourceCore]; ok {
-					corenum = int32(cv.Value())
-				} else if cv, ok := ctr.Resources.Requests[ascendResourceCore]; ok {
-					corenum = int32(cv.Value())
+				cv, ok := ctr.Resources.Limits[ascendResourceCore]
+				if !ok {
+					cv, ok = ctr.Resources.Requests[ascendResourceCore]
+				}
+				if ok {
+					corenums, valid := cv.AsInt64()
+					if !valid || corenums < 0 || corenums > 100 {
+						klog.ErrorS(nil, "ascend device core request is out of range", "container", ctr.Name, "request", cv.String())
+						return device.ContainerDeviceRequest{}
+					}
+					corenum = int32(corenums)
 				}
 			}
 
@@ -433,7 +478,11 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 	var tmpDevs map[string]device.ContainerDevices
 	tmpDevs = make(map[string]device.ContainerDevices)
 	reason := make(map[string]int)
-	isMutex := util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod) == util.GPUSchedulerPolicyMutex.String()
+	if k.Coresreq > 100 || k.Coresreq < 0 {
+		klog.ErrorS(nil, "core limit out of range (must be 0-100)", "pod", klog.KObj(pod), "coresreq", k.Coresreq)
+		return false, tmpDevs, "core limit out of range"
+	}
+	isMutex := util.PolicyContains(util.GetGPUSchedulerPolicyByPod(device.GPUSchedulerPolicy, pod), util.GPUSchedulerPolicyMutex)
 
 	vnpuMode := ""
 	if pod != nil && pod.Annotations != nil {
@@ -441,6 +490,7 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 	}
 
 	isHAMiCore := (vnpuMode == VNPUModeHamiCore)
+	isTemplate := (vnpuMode == VNPUModeTemplate)
 
 	// Verify whether the Node supports hami vnpu core.
 	// Global hamiVnpuCore config acts as the default; node-level annotation takes higher priority.
@@ -457,6 +507,11 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 		klog.V(4).InfoS("Node filtered: pod requests hami-core but node does not support it", "pod", klog.KObj(pod))
 		return false, nil, common.GenReason(reason, len(devices))
 	}
+	if isTemplate && nodeSupportHamiCore {
+		reason[common.ModeNotFit]++
+		klog.V(4).InfoS("Node filtered: pod requests template mode but node uses hami-core", "pod", klog.KObj(pod))
+		return false, nil, common.GenReason(reason, len(devices))
+	}
 	klog.V(4).InfoS("Fit: vnpu-mode annotation", "pod", pod.Name, "vnpuMode", vnpuMode)
 
 	needTopology := false
@@ -464,6 +519,10 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 		klog.V(4).Infof("all devices have NetworkID. device CommonWord %s", npu.CommonWord())
 		needTopology = true
 	}
+	// Full module pair allocation only applies to SuperPod deployments, the
+	// same gate MutateAdmission uses. Split mode carves vNPUs out of single
+	// devices and must not be forced onto whole physical cards.
+	pair910C := k.Type == Ascend910CType && originReq > 1 && npu.config.SuperPod
 	for i, v := range slices.Backward(devices) {
 		dev := v
 		klog.V(4).InfoS("scoring pod", "pod", klog.KObj(pod), "device", dev.ID, "Memreq", k.Memreq, "MemPercentagereq", k.MemPercentagereq, "Coresreq", k.Coresreq, "Nums", k.Nums, "device index", i)
@@ -505,11 +564,6 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 			klog.V(5).InfoS(common.ExclusiveDeviceAllocateConflict, "pod", klog.KObj(pod), "device", dev.ID, "device index", i, "used", dev.Used)
 			continue
 		}
-		if k.Coresreq > 100 {
-			klog.ErrorS(nil, "core limit can't exceed 100", "pod", klog.KObj(pod), "device", dev.ID)
-			k.Coresreq = 100
-			//return false, tmpDevs
-		}
 		if k.Memreq > 0 {
 			memreq = k.Memreq
 		}
@@ -547,7 +601,7 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 		}
 		if k.Nums > 0 {
 			klog.V(5).InfoS("find fit device", "pod", klog.KObj(pod), "device", dev.ID)
-			if !needTopology && (k.Type != Ascend910CType || originReq <= 1) {
+			if !needTopology && !pair910C {
 				k.Nums--
 			}
 			tmpDevs[k.Type] = append(tmpDevs[k.Type], device.ContainerDevice{
@@ -559,13 +613,13 @@ func (npu *Devices) Fit(devices []*device.DeviceUsage, request device.ContainerD
 				CustomInfo: dev.CustomInfo,
 			})
 		}
-		if k.Nums == 0 && !needTopology && (k.Type != Ascend910CType || originReq <= 1) {
+		if k.Nums == 0 && !needTopology && !pair910C {
 			klog.V(4).InfoS("device allocate success", "pod", klog.KObj(pod), "allocate device", tmpDevs)
 			return true, tmpDevs, ""
 		}
 	}
 
-	if k.Type == Ascend910CType && originReq > 1 {
+	if pair910C {
 		// Ascend 910C requires full module-pair allocation (2 NPUs per physical card).
 		combination := npu.computeBestCombination910C(nodeInfo, int(originReq), tmpDevs[k.Type])
 		if len(combination) != int(originReq) {
@@ -664,7 +718,7 @@ func (npudev *Devices) computeBestCombination910C(nodeInfo *device.NodeInfo, req
 	indexToDevice := make(map[int]device.ContainerDevice)
 	var npuIndices []int
 	for _, dev := range containerDevices {
-		idx := int(dev.Idx)
+		idx := dev.Idx
 		indexToDevice[idx] = dev
 		npuIndices = append(npuIndices, idx)
 	}

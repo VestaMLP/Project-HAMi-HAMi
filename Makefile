@@ -93,6 +93,12 @@ lint_chart:
       (($$?==0)) || { echo "error, failed to check chart trivy" && exit 1 ; } ; \
       echo "chart trivy check: pass"
 
+.PHONY: verify_chart
+verify_chart:
+	$(MAKE) -C charts validate
+	bash ./hack/verify-chart-version.sh
+	$(MAKE) lint_chart
+
 .PHONY: e2e-env-setup
 e2e-env-setup:
 	./hack/e2e-test-setup.sh
@@ -108,3 +114,15 @@ local-deploy: docker
 .PHONY: e2e-test
 e2e-test:
 	./hack/e2e-test.sh "${E2E_TYPE}" "${KUBE_CONF}"
+
+.PHONY: e2e-mig-test
+e2e-mig-test:
+	./hack/e2e-mig-test.sh "${KUBE_CONF}"
+
+.PHONY: e2e-mig-smoke-test
+e2e-mig-smoke-test:
+	./hack/e2e-mig-smoke-test.sh "${KUBE_CONF}"
+
+.PHONY: e2e-policy-test
+e2e-policy-test:
+	HAMI_E2E_REQUIRE_POLICY_TOPOLOGY=true bash ./hack/e2e-policy-test.sh "${KUBE_CONF}"

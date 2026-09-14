@@ -185,6 +185,79 @@ func Test_MutateAdmission_MemoryPercentageValidation(t *testing.T) {
 	}
 }
 
+func Test_MutateAdmission_CoresValidation(t *testing.T) {
+	gpuDevices := &NvidiaGPUDevices{
+		config: NvidiaConfig{
+			ResourceCountName:            "nvidia.com/gpu",
+			ResourceMemoryName:           "nvidia.com/gpumem",
+			ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+			ResourceCoreName:             "nvidia.com/gpucores",
+			DefaultGPUNum:                int32(1),
+		},
+	}
+	tests := []struct {
+		name    string
+		cores   int64
+		wantErr bool
+	}{
+		{
+			name:    "cores of 0 is accepted",
+			cores:   0,
+			wantErr: false,
+		},
+		{
+			name:    "cores of 50 is accepted",
+			cores:   50,
+			wantErr: false,
+		},
+		{
+			name:    "cores of 100 is accepted",
+			cores:   100,
+			wantErr: false,
+		},
+		{
+			name:    "cores of 101 is rejected",
+			cores:   101,
+			wantErr: true,
+		},
+		{
+			name:    "cores of 150 is rejected",
+			cores:   150,
+			wantErr: true,
+		},
+		{
+			name:    "cores of 200 is rejected",
+			cores:   200,
+			wantErr: true,
+		},
+		{
+			name:    "negative cores is rejected",
+			cores:   -1,
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctr := &corev1.Container{
+				Name: "test",
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+						"nvidia.com/gpucores": *resource.NewQuantity(test.cores, resource.DecimalSI),
+					},
+				},
+			}
+			_, err := gpuDevices.MutateAdmission(ctr, &corev1.Pod{})
+			if test.wantErr && err == nil {
+				t.Fatalf("expected MutateAdmission to reject cores %d, but got no error", test.cores)
+			}
+			if !test.wantErr && err != nil {
+				t.Fatalf("expected MutateAdmission to accept cores %d, but got error: %v", test.cores, err)
+			}
+		})
+	}
+}
+
 func TestMutateAdmissionDefaultsExclusiveCore(t *testing.T) {
 	ptr := func(v int64) *int64 { return &v }
 	clone := func(in corev1.ResourceList) corev1.ResourceList {
@@ -981,7 +1054,7 @@ func TestDevices_Fit(t *testing.T) {
 			wantReason: "1/1 CardTimeSlicingExhausted",
 		},
 		{
-			name: "fit success: but core limit can't exceed 100",
+			name: "fit fail: core limit out of range",
 			devices: []*device.DeviceUsage{{
 				ID:        "dev-0",
 				Index:     0,
@@ -1003,10 +1076,10 @@ func TestDevices_Fit(t *testing.T) {
 				Type:             NvidiaGPUDevice,
 			},
 			annos:      map[string]string{},
-			wantFit:    true,
-			wantLen:    1,
-			wantDevIDs: []string{"dev-0"},
-			wantReason: "",
+			wantFit:    false,
+			wantLen:    0,
+			wantDevIDs: []string{},
+			wantReason: "1/1 CardInsufficientCore",
 		},
 		{
 			name: "fit fail:  card exclusively",
@@ -1221,6 +1294,80 @@ func TestDevices_Fit(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFit_DeviceCordon(t *testing.T) {
+	config := NvidiaConfig{
+		ResourceCountName:            "nvidia.com/gpu",
+		ResourceMemoryName:           "nvidia.com/gpumem",
+		ResourceCoreName:             "nvidia.com/gpumem",
+		ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+	}
+	dev := InitNvidiaDevice(config)
+
+	newDevices := func() []*device.DeviceUsage {
+		return []*device.DeviceUsage{
+			{ID: "dev-0", Count: 100, Totalmem: 128, Totalcore: 100, Type: NvidiaGPUDevice, Health: true},
+			{ID: "dev-1", Count: 100, Totalmem: 128, Totalcore: 100, Type: NvidiaGPUDevice, Health: true},
+		}
+	}
+	request := device.ContainerDeviceRequest{Nums: 1, Memreq: 64, Coresreq: 50, Type: NvidiaGPUDevice}
+	pod := &corev1.Pod{}
+
+	nodeWithCordon := func(uuids string) *device.NodeInfo {
+		return &device.NodeInfo{Node: &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{DeviceCordonAnnotation: uuids}},
+		}}
+	}
+
+	t.Run("cordoned device is skipped, healthy sibling still fits", func(t *testing.T) {
+		fit, result, reason := dev.Fit(newDevices(), request, pod, nodeWithCordon("dev-1, "), &device.PodDevices{})
+		if !fit {
+			t.Fatalf("expected fit, got reason: %s", reason)
+		}
+		if got := result[NvidiaGPUDevice][0].UUID; got != "dev-0" {
+			t.Errorf("expected dev-0 (dev-1 is cordoned), got %s", got)
+		}
+	})
+
+	t.Run("all devices cordoned fails with CardCordoned reason", func(t *testing.T) {
+		fit, _, reason := dev.Fit(newDevices(), request, pod, nodeWithCordon("dev-0,dev-1"), &device.PodDevices{})
+		if fit {
+			t.Fatal("expected no fit, all devices are cordoned")
+		}
+		if reason != "2/2 CardCordoned" {
+			t.Errorf("expected reason %q, got %q", "2/2 CardCordoned", reason)
+		}
+	})
+
+	t.Run("running pods on a cordoned device are unaffected", func(t *testing.T) {
+		devices := newDevices()
+		devices[1].Used = 1
+		devices[1].Usedcores = 50
+		devices[1].Usedmem = 64
+		fit, result, _ := dev.Fit(devices, request, pod, nodeWithCordon("dev-1"), &device.PodDevices{})
+		if !fit {
+			t.Fatal("expected fit onto the non-cordoned device")
+		}
+		if got := result[NvidiaGPUDevice][0].UUID; got != "dev-0" {
+			t.Errorf("expected dev-0, got %s", got)
+		}
+		if devices[1].Used != 1 {
+			t.Errorf("cordon must not touch existing usage on dev-1, got Used=%d", devices[1].Used)
+		}
+	})
+
+	t.Run("no annotation or no node info means nothing cordoned", func(t *testing.T) {
+		for name, ni := range map[string]*device.NodeInfo{
+			"node present, annotation absent": {Node: &corev1.Node{}},
+			"NodeInfo.Node is nil":            {},
+		} {
+			fit, _, reason := dev.Fit(newDevices(), request, pod, ni, &device.PodDevices{})
+			if !fit {
+				t.Errorf("%s: expected fit, got reason: %s", name, reason)
+			}
+		}
+	})
 }
 
 func TestDevices_AddResourceUsage(t *testing.T) {
@@ -1768,7 +1915,25 @@ func TestGenerateResourceRequests(t *testing.T) {
 			},
 		},
 		{
-			name: "gpu count + explicit cores",
+			name: "gpu count + explicit cores 0",
+			ctr: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+						"nvidia.com/gpucores": *resource.NewQuantity(0, resource.DecimalSI),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             1,
+				Type:             NvidiaGPUDevice,
+				Memreq:           0,
+				MemPercentagereq: 100,
+				Coresreq:         0,
+			},
+		},
+		{
+			name: "gpu count + explicit cores 50",
 			ctr: &corev1.Container{
 				Resources: corev1.ResourceRequirements{
 					Limits: corev1.ResourceList{
@@ -1784,6 +1949,84 @@ func TestGenerateResourceRequests(t *testing.T) {
 				MemPercentagereq: 100,
 				Coresreq:         50,
 			},
+		},
+		{
+			name: "gpu count + explicit cores 100",
+			ctr: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+						"nvidia.com/gpucores": *resource.NewQuantity(100, resource.DecimalSI),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{
+				Nums:             1,
+				Type:             NvidiaGPUDevice,
+				Memreq:           0,
+				MemPercentagereq: 100,
+				Coresreq:         100,
+			},
+		},
+		{
+			name: "gpu count + explicit cores 101 — rejected",
+			ctr: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+						"nvidia.com/gpucores": *resource.NewQuantity(101, resource.DecimalSI),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "gpu count + explicit cores 150 — rejected",
+			ctr: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+						"nvidia.com/gpucores": *resource.NewQuantity(150, resource.DecimalSI),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "gpu count + explicit cores 200 — rejected",
+			ctr: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+						"nvidia.com/gpucores": *resource.NewQuantity(200, resource.DecimalSI),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "gpu count + explicit cores negative -1 — rejected",
+			ctr: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+						"nvidia.com/gpucores": *resource.NewQuantity(-1, resource.DecimalSI),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "gpu count + explicit cores negative -50 — rejected",
+			ctr: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu":      *resource.NewQuantity(1, resource.BinarySI),
+						"nvidia.com/gpucores": *resource.NewQuantity(-50, resource.DecimalSI),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
 		},
 		{
 			name: "no gpu resource — returns empty request",
@@ -1884,6 +2127,66 @@ func TestGenerateResourceRequests(t *testing.T) {
 				Coresreq:         0,
 			},
 		},
+		{
+			name: "byte-scale memory quantity that overflows int32 is rejected",
+			ctr: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu":    *resource.NewQuantity(1, resource.BinarySI),
+						"nvidia.com/gpumem": resource.MustParse("16Gi"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "decimal-form memory request is rejected, not treated as zero",
+			ctr: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu":    *resource.NewQuantity(1, resource.BinarySI),
+						"nvidia.com/gpumem": resource.MustParse("16.0Gi"),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "gpu count zero is rejected",
+			ctr: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu": *resource.NewQuantity(0, resource.BinarySI),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "negative gpu count is rejected",
+			ctr: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu": *resource.NewQuantity(-1, resource.BinarySI),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
+		{
+			name: "gpu count above int32 max is rejected",
+			ctr: &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu": *resource.NewQuantity(
+							2147483648,
+							resource.BinarySI,
+						),
+					},
+				},
+			},
+			want: device.ContainerDeviceRequest{},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1913,6 +2216,10 @@ func TestGenerateResourceRequests_MemoryFactor(t *testing.T) {
 	}
 	result := dev.GenerateResourceRequests(ctr)
 	assert.Equal(t, result.Memreq, int32(2048))
+
+	ctr.Resources.Limits["nvidia.com/gpumem"] = resource.MustParse("1Gi")
+	result = dev.GenerateResourceRequests(ctr)
+	assert.DeepEqual(t, result, device.ContainerDeviceRequest{})
 }
 
 func TestGenerateResourceRequests_DefaultMemory(t *testing.T) {
@@ -2137,15 +2444,63 @@ func TestLockNode(t *testing.T) {
 			name: "no GPU containers — skip lock",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Name: "pod-no-gpu", Namespace: "default"},
-				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{{Name: "init-no-gpu"}},
+					Containers:     []corev1.Container{{Name: "app"}},
+				},
 			},
 			hasLock: false,
 		},
 		{
-			name: "has GPU container — acquires lock",
+			name: "regular-container-only GPU request — acquires lock",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Name: "pod-gpu", Namespace: "default"},
 				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Name: "gpu-app",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								"nvidia.com/gpu": *resource.NewQuantity(1, resource.BinarySI),
+							},
+						},
+					}},
+				},
+			},
+			hasLock: true,
+		},
+		{
+			name: "init-container-only GPU request — acquires lock",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-init-gpu", Namespace: "default"},
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{{
+						Name: "gpu-init",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								"nvidia.com/gpu": *resource.NewQuantity(1, resource.BinarySI),
+							},
+						},
+					}},
+					Containers: []corev1.Container{{
+						Name: "cpu-app",
+					}},
+				},
+			},
+			hasLock: true,
+		},
+		{
+			name: "init and regular container GPU request — acquires lock",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-init-and-reg-gpu", Namespace: "default"},
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{{
+						Name: "gpu-init",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								"nvidia.com/gpu": *resource.NewQuantity(1, resource.BinarySI),
+							},
+						},
+					}},
 					Containers: []corev1.Container{{
 						Name: "gpu-app",
 						Resources: corev1.ResourceRequirements{
@@ -2422,18 +2777,23 @@ func TestReleaseNodeLock(t *testing.T) {
 	tests := []struct {
 		name    string
 		pod     *corev1.Pod
+		lockVal string
 		hasLock bool
 	}{
 		{
 			name: "no GPU containers — skip release, lock remains",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Name: "pod-no-gpu", Namespace: "default"},
-				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{{Name: "init-no-gpu"}},
+					Containers:     []corev1.Container{{Name: "app"}},
+				},
 			},
+			lockVal: "lock-values,default,pod-no-gpu",
 			hasLock: true,
 		},
 		{
-			name: "has GPU container — releases lock",
+			name: "regular-container-only GPU request — releases lock",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{Name: "pod-gpu", Namespace: "default"},
 				Spec: corev1.PodSpec{
@@ -2447,6 +2807,52 @@ func TestReleaseNodeLock(t *testing.T) {
 					}},
 				},
 			},
+			lockVal: "lock-values,default,pod-gpu",
+			hasLock: false,
+		},
+		{
+			name: "init-container-only GPU request — releases lock",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-init-gpu", Namespace: "default"},
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{{
+						Name: "gpu-init",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								"nvidia.com/gpu": *resource.NewQuantity(1, resource.BinarySI),
+							},
+						},
+					}},
+					Containers: []corev1.Container{{Name: "cpu-app"}},
+				},
+			},
+			lockVal: "lock-values,default,pod-init-gpu",
+			hasLock: false,
+		},
+		{
+			name: "init and regular container GPU request — releases lock",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "pod-init-reg-gpu", Namespace: "default"},
+				Spec: corev1.PodSpec{
+					InitContainers: []corev1.Container{{
+						Name: "gpu-init",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								"nvidia.com/gpu": *resource.NewQuantity(1, resource.BinarySI),
+							},
+						},
+					}},
+					Containers: []corev1.Container{{
+						Name: "gpu-app",
+						Resources: corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{
+								"nvidia.com/gpu": *resource.NewQuantity(1, resource.BinarySI),
+							},
+						},
+					}},
+				},
+			},
+			lockVal: "lock-values,default,pod-init-reg-gpu",
 			hasLock: false,
 		},
 	}
@@ -2454,11 +2860,15 @@ func TestReleaseNodeLock(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client.KubeClient = fake.NewClientset()
+			lockVal := tt.lockVal
+			if lockVal == "" {
+				lockVal = "lock-values,default," + tt.pod.Name
+			}
 			node := &corev1.Node{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-node",
 					Annotations: map[string]string{
-						nodelock.NodeLockKey: "lock-values,default,pod-gpu",
+						nodelock.NodeLockKey: lockVal,
 					},
 				},
 			}
@@ -2750,4 +3160,459 @@ func TestFit_TopologyNegativeScores(t *testing.T) {
 		assert.Assert(t, uuids["dev-1"])
 		assert.Assert(t, uuids["dev-2"])
 	})
+}
+
+// TestNodeDeleted_ClearsBookkeepingForDeletedNode verifies that NodeDeleted
+// removes both ReportedGPUNum and ReportedRegisterAnnos entries for the
+// named node while leaving other nodes' entries intact.
+func TestNodeDeleted_ClearsBookkeepingForDeletedNode(t *testing.T) {
+	dev := InitNvidiaDevice(NvidiaConfig{ResourceCountName: "nvidia.com/gpu"})
+
+	// Populate bookkeeping for two nodes.
+	dev.mu.Lock()
+	dev.ReportedGPUNum["node-a"] = 4
+	dev.ReportedGPUNum["node-b"] = 2
+	dev.ReportedRegisterAnnos["node-a"] = "anno-a"
+	dev.ReportedRegisterAnnos["node-b"] = "anno-b"
+	dev.mu.Unlock()
+
+	// Delete node-a.
+	dev.NodeDeleted("node-a")
+
+	dev.mu.Lock()
+	defer dev.mu.Unlock()
+
+	// node-a entries must be gone.
+	_, gpuPresent := dev.ReportedGPUNum["node-a"]
+	assert.Assert(t, !gpuPresent, "expected ReportedGPUNum entry for node-a to be removed")
+	_, annoPresent := dev.ReportedRegisterAnnos["node-a"]
+	assert.Assert(t, !annoPresent, "expected ReportedRegisterAnnos entry for node-a to be removed")
+
+	// node-b must be untouched.
+	assert.Equal(t, dev.ReportedGPUNum["node-b"], int64(2), "ReportedGPUNum for node-b must be unchanged")
+	assert.Equal(t, dev.ReportedRegisterAnnos["node-b"], "anno-b", "ReportedRegisterAnnos for node-b must be unchanged")
+}
+
+// TestNodeDeleted_IdempotentOnUnknownNode verifies that calling NodeDeleted
+// for a node that was never registered does not panic or error.
+func TestNodeDeleted_IdempotentOnUnknownNode(t *testing.T) {
+	dev := InitNvidiaDevice(NvidiaConfig{ResourceCountName: "nvidia.com/gpu"})
+	// Should not panic.
+	dev.NodeDeleted("node-never-registered")
+	dev.mu.Lock()
+	defer dev.mu.Unlock()
+	assert.Equal(t, len(dev.ReportedGPUNum), 0)
+	assert.Equal(t, len(dev.ReportedRegisterAnnos), 0)
+}
+
+// TestNodeDeleted_ReuseAfterDeletion verifies that after a node is deleted its
+// bookkeeping is cleared so that a subsequent CheckHealth call for a node with
+// the same name (i.e. re-created node) is not hampered by stale state.
+func TestNodeDeleted_ReuseAfterDeletion(t *testing.T) {
+	config := NvidiaConfig{ResourceCountName: "nvidia.com/gpu"}
+	dev := InitNvidiaDevice(config)
+
+	allocatable := corev1.ResourceList{
+		corev1.ResourceName(config.ResourceCountName): *resource.NewQuantity(4, resource.DecimalSI),
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "reused-node",
+			Annotations: map[string]string{
+				util.HandshakeAnnos[NvidiaGPUDevice]: "Heartbeat_2099-01-01T00:00:00Z",
+			},
+		},
+		Status: corev1.NodeStatus{Allocatable: allocatable},
+	}
+
+	// Simulate a prior registration cycle: CheckHealth establishes bookkeeping.
+	dev.mu.Lock()
+	dev.ReportedGPUNum["reused-node"] = 4
+	dev.ReportedRegisterAnnos["reused-node"] = "old-anno"
+	dev.mu.Unlock()
+
+	// Node deleted — bookkeeping must be wiped.
+	dev.NodeDeleted("reused-node")
+
+	// After re-creation the new CheckHealth must detect a change (needUpdate=true)
+	// because reported=0 (after deletion) != current=4.
+	healthy, needUpdate := dev.CheckHealth("NVIDIA", node)
+	assert.Equal(t, healthy, true, "re-created node should be healthy")
+	assert.Equal(t, needUpdate, true, "re-created node must trigger an update (stale bookkeeping was cleared)")
+}
+
+func TestFit_CoresValidation(t *testing.T) {
+	dev := InitNvidiaDevice(NvidiaConfig{
+		ResourceCountName:            "nvidia.com/gpu",
+		ResourceMemoryName:           "nvidia.com/gpumem",
+		ResourceCoreName:             "nvidia.com/gpucores",
+		ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+	})
+	devices := []*device.DeviceUsage{
+		{
+			ID:        "GPU-1",
+			Index:     0,
+			Count:     10,
+			Totalmem:  8000,
+			Totalcore: 100,
+			Used:      0,
+			Usedmem:   0,
+			Usedcores: 0,
+			Health:    true,
+			Type:      NvidiaGPUDevice,
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+		},
+	}
+
+	tests := []struct {
+		name     string
+		coresreq int32
+		wantOk   bool
+	}{
+		{
+			name:     "cores 0 is accepted",
+			coresreq: 0,
+			wantOk:   true,
+		},
+		{
+			name:     "cores 50 is accepted",
+			coresreq: 50,
+			wantOk:   true,
+		},
+		{
+			name:     "cores 100 is accepted",
+			coresreq: 100,
+			wantOk:   true,
+		},
+		{
+			name:     "cores 101 is rejected",
+			coresreq: 101,
+			wantOk:   false,
+		},
+		{
+			name:     "cores 150 is rejected and not converted to 100",
+			coresreq: 150,
+			wantOk:   false,
+		},
+		{
+			name:     "cores 200 is rejected",
+			coresreq: 200,
+			wantOk:   false,
+		},
+		{
+			name:     "negative cores -1 is rejected",
+			coresreq: -1,
+			wantOk:   false,
+		},
+		{
+			name:     "negative cores -50 is rejected",
+			coresreq: -50,
+			wantOk:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := device.ContainerDeviceRequest{
+				Nums:     1,
+				Type:     NvidiaGPUDevice,
+				Memreq:   1000,
+				Coresreq: tt.coresreq,
+			}
+			ok, _, _ := dev.Fit(devices, req, pod, &device.NodeInfo{}, &device.PodDevices{})
+			assert.Equal(t, ok, tt.wantOk)
+		})
+	}
+}
+
+func TestMutateAdmission_CoresValidation_InvalidCores(t *testing.T) {
+	dev := InitNvidiaDevice(NvidiaConfig{
+		ResourceCountName:            "nvidia.com/gpu",
+		ResourceMemoryName:           "nvidia.com/gpumem",
+		ResourceCoreName:             "nvidia.com/gpucores",
+		ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+	})
+
+	tests := []struct {
+		name      string
+		cores     string
+		wantValid bool
+	}{
+		{name: "0 cores accepted", cores: "0", wantValid: true},
+		{name: "50 cores accepted", cores: "50", wantValid: true},
+		{name: "100 cores accepted", cores: "100", wantValid: true},
+		{name: "-1 cores rejected", cores: "-1", wantValid: false},
+		{name: "101 cores rejected", cores: "101", wantValid: false},
+		{name: "50m cores rejected", cores: "50m", wantValid: false},
+		{name: "99.1 cores rejected", cores: "99.1", wantValid: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctr := &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu":      resource.MustParse("1"),
+						"nvidia.com/gpucores": resource.MustParse(tt.cores),
+					},
+				},
+			}
+			_, err := dev.MutateAdmission(ctr, &corev1.Pod{})
+			if tt.wantValid {
+				assert.NilError(t, err)
+			} else {
+				assert.ErrorContains(t, err, "must be an integer between 0 and 100")
+			}
+		})
+	}
+}
+
+func Test_GenerateResourceRequests_CoresValidation(t *testing.T) {
+	dev := InitNvidiaDevice(NvidiaConfig{
+		ResourceCountName:            "nvidia.com/gpu",
+		ResourceMemoryName:           "nvidia.com/gpumem",
+		ResourceCoreName:             "nvidia.com/gpucores",
+		ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+	})
+
+	tests := []struct {
+		name    string
+		cores   string
+		wantOk  bool
+		wantVal int32
+	}{
+		{name: "0 cores", cores: "0", wantOk: true, wantVal: 0},
+		{name: "50 cores", cores: "50", wantOk: true, wantVal: 50},
+		{name: "100 cores", cores: "100", wantOk: true, wantVal: 100},
+		{name: "101 cores", cores: "101", wantOk: false},
+		{name: "150 cores", cores: "150", wantOk: false},
+		{name: "200 cores", cores: "200", wantOk: false},
+		{name: "-1 cores", cores: "-1", wantOk: false},
+		{name: "fractional 50m", cores: "50m", wantOk: false},
+		{name: "fractional 99.1", cores: "99.1", wantOk: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctr := &corev1.Container{
+				Resources: corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{
+						"nvidia.com/gpu":      resource.MustParse("1"),
+						"nvidia.com/gpucores": resource.MustParse(tt.cores),
+					},
+				},
+			}
+			req := dev.GenerateResourceRequests(ctr)
+			if tt.wantOk {
+				assert.Equal(t, req.Nums, int32(1))
+				assert.Equal(t, req.Coresreq, tt.wantVal)
+			} else {
+				assert.Equal(t, req.Nums, int32(0))
+			}
+		})
+	}
+}
+
+// migTopologyDevice builds the NVIDIA backend used by the MIG topology tests.
+func migTopologyDevice() *NvidiaGPUDevices {
+	return InitNvidiaDevice(NvidiaConfig{
+		ResourceCountName:            "nvidia.com/gpu",
+		ResourceMemoryName:           "nvidia.com/gpumem",
+		ResourceCoreName:             "nvidia.com/gpucores",
+		ResourceMemoryPercentageName: "nvidia.com/gpumem-percentage",
+	})
+}
+
+// migTopologyDevices builds MIG cards with seven single-slice placements each,
+// so the Fit loop contributes seven interchangeable candidates per card.
+func migTopologyDevices(ids ...string) []*device.DeviceUsage {
+	placements := make([]device.MigPlacement, 0, 7)
+	for start := range uint32(7) {
+		placements = append(placements, device.MigPlacement{Start: start, Size: 1})
+	}
+	devices := make([]*device.DeviceUsage, 0, len(ids))
+	for idx, id := range ids {
+		devices = append(devices, &device.DeviceUsage{
+			ID: id, Index: uint(idx), Used: 0, Count: 7,
+			Totalmem: 81920, Totalcore: 100, Type: NvidiaGPUDevice, Health: true,
+			Mode: MigMode,
+			MigProfiles: []device.MigProfile{
+				{Name: "1g.10gb", MemoryMB: 10240, Core: 14, SliceCount: 1, Placements: placements},
+			},
+		})
+	}
+	return devices
+}
+
+// migTopologyNodeInfo registers cards with no pair score, as on a node where
+// hami.io/node-nvidia-score was never published.
+func migTopologyNodeInfo(ids ...string) *device.NodeInfo {
+	infos := make([]device.DeviceInfo, 0, len(ids))
+	for _, id := range ids {
+		infos = append(infos, device.DeviceInfo{ID: id})
+	}
+	return &device.NodeInfo{Devices: map[string][]device.DeviceInfo{NvidiaGPUDevice: infos}}
+}
+
+func migTopologyPod() *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{util.GPUSchedulerPolicyAnnotationKey: util.GPUSchedulerPolicyTopology.String()},
+		},
+	}
+}
+
+func distinctUUIDs(devices device.ContainerDevices) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(devices))
+	for _, dev := range devices {
+		if _, ok := seen[dev.UUID]; ok {
+			continue
+		}
+		seen[dev.UUID] = struct{}{}
+		out = append(out, dev.UUID)
+	}
+	return out
+}
+
+// Without pair scores every combination ties at zero, so the first one generated
+// wins; that used to be several slots of one card with the others left idle.
+func TestFit_TopologyMigSpreadsAcrossCardsWithoutScores(t *testing.T) {
+	nv := migTopologyDevice()
+	devices := migTopologyDevices("dev-0", "dev-1", "dev-2")
+	nodeInfo := migTopologyNodeInfo("dev-0", "dev-1", "dev-2")
+
+	req := device.ContainerDeviceRequest{Nums: 2, Memreq: 10240, Coresreq: 10, Type: NvidiaGPUDevice}
+	fit, result, msg := nv.Fit(devices, req, migTopologyPod(), nodeInfo, &device.PodDevices{})
+
+	assert.Equal(t, fit, true, msg)
+	assert.Equal(t, len(result[NvidiaGPUDevice]), 2)
+	assert.Equal(t, len(distinctUUIDs(result[NvidiaGPUDevice])), 2,
+		"a 2-GPU request must land on two physical cards, got %v", distinctUUIDs(result[NvidiaGPUDevice]))
+}
+
+// The reported scenario: eight MIG cards, seven slots each, five GPUs requested.
+// The 56-entry pool enumerated C(56,5) and still packed every slot onto one card.
+func TestFit_TopologyMigSpreadsLargeRequest(t *testing.T) {
+	ids := []string{"dev-0", "dev-1", "dev-2", "dev-3", "dev-4", "dev-5", "dev-6", "dev-7"}
+	nv := migTopologyDevice()
+	devices := migTopologyDevices(ids...)
+	nodeInfo := migTopologyNodeInfo(ids...)
+
+	req := device.ContainerDeviceRequest{Nums: 5, Memreq: 10240, Coresreq: 10, Type: NvidiaGPUDevice}
+	fit, result, msg := nv.Fit(devices, req, migTopologyPod(), nodeInfo, &device.PodDevices{})
+
+	assert.Equal(t, fit, true, msg)
+	assert.Equal(t, len(result[NvidiaGPUDevice]), 5)
+	assert.Equal(t, len(distinctUUIDs(result[NvidiaGPUDevice])), 5,
+		"a 5-GPU request must land on five physical cards, got %v", distinctUUIDs(result[NvidiaGPUDevice]))
+}
+
+// Collapsing the pool must not change which cards topology scoring prefers: the
+// best-connected pair still wins when the node does publish pair scores.
+func TestFit_TopologyMigBestCombinationWithScores(t *testing.T) {
+	nv := migTopologyDevice()
+	devices := migTopologyDevices("dev-0", "dev-1", "dev-2")
+	nodeInfo := &device.NodeInfo{
+		Devices: map[string][]device.DeviceInfo{
+			NvidiaGPUDevice: {
+				{ID: "dev-0", DevicePairScore: device.DevicePairScore{Scores: map[string]int{"dev-1": 100, "dev-2": 200}}},
+				{ID: "dev-1", DevicePairScore: device.DevicePairScore{Scores: map[string]int{"dev-0": 100, "dev-2": 150}}},
+				{ID: "dev-2", DevicePairScore: device.DevicePairScore{Scores: map[string]int{"dev-0": 200, "dev-1": 150}}},
+			},
+		},
+	}
+
+	req := device.ContainerDeviceRequest{Nums: 2, Memreq: 10240, Coresreq: 10, Type: NvidiaGPUDevice}
+	fit, result, msg := nv.Fit(devices, req, migTopologyPod(), nodeInfo, &device.PodDevices{})
+
+	assert.Equal(t, fit, true, msg)
+	assert.Equal(t, len(result[NvidiaGPUDevice]), 2)
+	uuids := distinctUUIDs(result[NvidiaGPUDevice])
+	assert.Equal(t, len(uuids), 2, "got %v", uuids)
+	// dev-0 <-> dev-2 scores 200, the highest pair on this node.
+	assert.Assert(t, uuids[0] == "dev-0" || uuids[1] == "dev-0", "expected dev-0 in %v", uuids)
+	assert.Assert(t, uuids[0] == "dev-2" || uuids[1] == "dev-2", "expected dev-2 in %v", uuids)
+}
+
+// The single-GPU path still picks the least-connected card: duplicates scaled
+// every card's total by its slot count, which left the ranking intact.
+func TestFit_TopologyMigWorstSingleCard(t *testing.T) {
+	nv := migTopologyDevice()
+	devices := migTopologyDevices("dev-0", "dev-1", "dev-2")
+	nodeInfo := &device.NodeInfo{
+		Devices: map[string][]device.DeviceInfo{
+			NvidiaGPUDevice: {
+				{ID: "dev-0", DevicePairScore: device.DevicePairScore{Scores: map[string]int{"dev-1": 100, "dev-2": 200}}},
+				{ID: "dev-1", DevicePairScore: device.DevicePairScore{Scores: map[string]int{"dev-0": 100, "dev-2": 150}}},
+				{ID: "dev-2", DevicePairScore: device.DevicePairScore{Scores: map[string]int{"dev-0": 200, "dev-1": 150}}},
+			},
+		},
+	}
+
+	req := device.ContainerDeviceRequest{Nums: 1, Memreq: 10240, Coresreq: 10, Type: NvidiaGPUDevice}
+	fit, result, msg := nv.Fit(devices, req, migTopologyPod(), nodeInfo, &device.PodDevices{})
+
+	assert.Equal(t, fit, true, msg)
+	assert.Equal(t, len(result[NvidiaGPUDevice]), 1)
+	// dev-1 totals 250, below dev-0 (300) and dev-2 (350).
+	assert.Equal(t, result[NvidiaGPUDevice][0].UUID, "dev-1")
+}
+
+// With fewer cards than requested GPUs the full pool is kept, so MIG instances
+// on one card still satisfy the request instead of it being rejected.
+func TestFit_TopologyMigPacksOneCardWhenNoAlternative(t *testing.T) {
+	nv := migTopologyDevice()
+	devices := migTopologyDevices("dev-0")
+	nodeInfo := migTopologyNodeInfo("dev-0")
+
+	req := device.ContainerDeviceRequest{Nums: 2, Memreq: 10240, Coresreq: 10, Type: NvidiaGPUDevice}
+	fit, result, msg := nv.Fit(devices, req, migTopologyPod(), nodeInfo, &device.PodDevices{})
+
+	assert.Equal(t, fit, true, msg)
+	assert.Equal(t, len(result[NvidiaGPUDevice]), 2)
+	assert.Equal(t, len(distinctUUIDs(result[NvidiaGPUDevice])), 1,
+		"the only card on the node must supply both instances")
+}
+
+func TestDistinctCardCandidates(t *testing.T) {
+	tests := []struct {
+		name       string
+		candidates device.ContainerDevices
+		want       []string
+	}{
+		{
+			name: "collapses repeated cards and keeps first-seen order",
+			candidates: device.ContainerDevices{
+				{UUID: "dev-2", Idx: 2}, {UUID: "dev-2", Idx: 2},
+				{UUID: "dev-0", Idx: 0}, {UUID: "dev-2", Idx: 2},
+				{UUID: "dev-1", Idx: 1}, {UUID: "dev-0", Idx: 0},
+			},
+			want: []string{"dev-2", "dev-0", "dev-1"},
+		},
+		{
+			name:       "already distinct is unchanged",
+			candidates: device.ContainerDevices{{UUID: "dev-0"}, {UUID: "dev-1"}},
+			want:       []string{"dev-0", "dev-1"},
+		},
+		{
+			name:       "empty stays empty",
+			candidates: device.ContainerDevices{},
+			want:       []string{},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := distinctCardCandidates(tc.candidates)
+			assert.Equal(t, len(got), len(tc.want))
+			for i := range tc.want {
+				assert.Equal(t, got[i].UUID, tc.want[i])
+			}
+		})
+	}
 }
