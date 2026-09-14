@@ -784,6 +784,7 @@ func (plugin *NvidiaDevicePlugin) Allocate(ctx context.Context, reqs *kubeletdev
 			responses.ContainerResponses = append(responses.ContainerResponses, response)
 		} else {
 			currentCtr, devreq, err := popNextContainerDevices(current, podSingleDev)
+
 			klog.Infoln("deviceAllocateFromAnnotation=", devreq)
 			if err != nil {
 				PodAllocationFailed(nodename, current, NodeLockNvidia)
@@ -854,8 +855,10 @@ func (plugin *NvidiaDevicePlugin) Allocate(ctx context.Context, reqs *kubeletdev
 						ReadOnly: false},
 				)
 				found := false
+				userSpecified := false
 				for _, val := range currentCtr.Env {
 					if strings.Compare(val.Name, "CUDA_DISABLE_CONTROL") == 0 {
+						userSpecified = true
 						// if env existed but is set to false or can not be parsed, ignore
 						t, _ := strconv.ParseBool(val.Value)
 						if !t {
@@ -864,6 +867,18 @@ func (plugin *NvidiaDevicePlugin) Allocate(ctx context.Context, reqs *kubeletdev
 						// only env existed and set to true, we mark it "found"
 						found = true
 						break
+					}
+				}
+				// 用户没有手动设置，并且是整卡分配，才自动注入
+				if !userSpecified {
+					// 整卡判断
+					isWhole := isWholeGPUAllocation(devreq, plugin.rm)
+					if isWhole {
+						response.Envs["CUDA_DISABLE_CONTROL"] = "true"
+						klog.Infof("整卡分配，自动注入 CUDA_DISABLE_CONTROL=true (pod=%s/%s, container=%s)",
+							current.Namespace, current.Name, currentCtr.Name)
+						// 标记found=true，跳过ld.so.preload注入
+						found = true
 					}
 				}
 				if !found {
@@ -1125,4 +1140,25 @@ func (plugin *NvidiaDevicePlugin) apiDeviceSpecs(devRoot string, ids []string) [
 func (plugin *NvidiaDevicePlugin) apiDevices() []*kubeletdevicepluginv1beta1.Device {
 	numaTopology := plugin.schedulerConfig.EnableNUMATopology != nil && *plugin.schedulerConfig.EnableNUMATopology
 	return plugin.Devices().GetPluginDevices(*plugin.schedulerConfig.DeviceSplitCount, numaTopology)
+}
+
+// isWholeGPUAllocation 判断当前容器的设备分配是否为整卡
+// 参数:
+//   - devreq: 当前容器的设备分配列表 (类型为 rm.ContainerDevices)
+//   - rm: ResourceManager 实例，用于查询设备详细信息
+func isWholeGPUAllocation(devreq device.ContainerDevices, rm rm.ResourceManager) bool {
+	if len(devreq) == 0 {
+		return false
+	}
+	allDevices := rm.Devices()
+	for _, dev := range devreq {
+		deviceInfo := allDevices.GetByID(dev.UUID)
+		if deviceInfo == nil {
+			return false
+		}
+		if uint64(dev.Usedmem) != deviceInfo.TotalMemory || dev.Usedcores != 100 {
+			return false
+		}
+	}
+	return true
 }

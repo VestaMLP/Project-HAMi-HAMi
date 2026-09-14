@@ -182,6 +182,8 @@ spec:
               value: "{{ .Values.global.gpuHookPath }}/vgpu"
             - name: HAMI_RESYNC_INTERVAL
               value: {{ .Values.devicePlugin.monitor.resyncInterval | default "5m" | quote }}
+            - name: HAMI_MONITOR_WHOLE_GPU
+              value: {{ .Values.devicePlugin.monitor.monitorWholeGPU | default false | quote }}
             {{- with .Values.devicePlugin.monitor.extraEnvs }}
             {{- . | toYaml | nindent 12 }}
             {{- end }}
