@@ -869,15 +869,15 @@ func (plugin *NvidiaDevicePlugin) Allocate(ctx context.Context, reqs *kubeletdev
 						break
 					}
 				}
-				// 用户没有手动设置，并且是整卡分配，才自动注入
+				// auto-inject CUDA_DISABLE_CONTROL=true only when the user hasn't
+				// set it explicitly and every allocated device is a whole GPU
 				if !userSpecified {
-					// 整卡判断
 					isWhole := isWholeGPUAllocation(devreq, plugin.rm)
 					if isWhole {
 						response.Envs["CUDA_DISABLE_CONTROL"] = "true"
-						klog.Infof("整卡分配，自动注入 CUDA_DISABLE_CONTROL=true (pod=%s/%s, container=%s)",
+						klog.Infof("whole-GPU allocation: injecting CUDA_DISABLE_CONTROL=true (pod=%s/%s, container=%s)",
 							current.Namespace, current.Name, currentCtr.Name)
-						// 标记found=true，跳过ld.so.preload注入
+						// mark found so the ld.so.preload mount below is skipped
 						found = true
 					}
 				}
@@ -1142,10 +1142,10 @@ func (plugin *NvidiaDevicePlugin) apiDevices() []*kubeletdevicepluginv1beta1.Dev
 	return plugin.Devices().GetPluginDevices(*plugin.schedulerConfig.DeviceSplitCount, numaTopology)
 }
 
-// isWholeGPUAllocation 判断当前容器的设备分配是否为整卡
-// 参数:
-//   - devreq: 当前容器的设备分配列表 (类型为 rm.ContainerDevices)
-//   - rm: ResourceManager 实例，用于查询设备详细信息
+// isWholeGPUAllocation reports whether every device allocated to the container
+// is a whole GPU (full memory and full cores).
+//   - devreq: devices allocated to the container (rm.ContainerDevices)
+//   - rm: ResourceManager used to look up device details
 func isWholeGPUAllocation(devreq device.ContainerDevices, rm rm.ResourceManager) bool {
 	if len(devreq) == 0 {
 		return false
